@@ -9,15 +9,11 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY Cargo.toml ./
-RUN mkdir -p src \
-    && printf 'pub fn _dummy() {}\n' > src/lib.rs \
-    && printf 'fn main() {}\n' > src/main.rs \
-    && cargo build --release \
-    && rm -rf src target/release/feishu2dav* target/release/deps/*feishu2dav* target/release/.fingerprint/feishu2dav-*
-
 COPY src ./src
+
 RUN cargo build --release \
-    && strip target/release/feishu2dav
+    && strip target/release/feishu2dav \
+    && /app/target/release/feishu2dav --help | grep -q "WebDAV"
 
 FROM debian:bookworm-slim
 
@@ -37,6 +33,8 @@ COPY --from=builder /app/target/release/feishu2dav /usr/local/bin/feishu2dav
 
 USER feishu2dav
 WORKDIR /data
+
+RUN /usr/local/bin/feishu2dav --help | grep -q "FEISHU_APP_ID"
 
 ENV FEISHU2DAV_LISTEN=0.0.0.0:4918 \
     FEISHU2DAV_TOKEN_FILE=/data/feishu2dav-tokens.json
