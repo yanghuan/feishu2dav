@@ -1,0 +1,31 @@
+[package]
+name = "feishu2dav"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Feishu (Lark) Cloud Drive WebDAV gateway using App ID/Secret + User OAuth"
+license = "MIT"
+
+[dependencies]
+adler2 = "2"
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+rand = "0.9"
+reqwest = { version = "0.13", features = ["json", "multipart", "query", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+dav-server = { version = "0.12", default-features = false, features = ["proppatch"] }
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["multipart"] }

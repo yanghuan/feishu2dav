@@ -1,0 +1,54 @@
+# Feishu Open Platform App credentials
+app_id = "cli_xxxxxxxxxxxxxxxx"
+app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Local HTTP server bind address (WebDAV + OAuth callback + status dashboard)
+listen = "127.0.0.1:4918"
+
+# Must match one of the Redirect URLs configured in Feishu Developer Console -> Security Settings
+# Defaults to http://127.0.0.1:<port>/oauth/callback
+# redirect_uri = "http://127.0.0.1:4918/oauth/callback"
+
+# Path to persist user_access_token & rotating refresh_token
+token_file = "feishu2dav-tokens.json"
+
+# Use https://open.larksuite.com and https://accounts.larksuite.com for international Lark
+api_base_url = "https://open.feishu.cn"
+accounts_base_url = "https://accounts.feishu.cn"
+
+# Space-separated user OAuth scopes
+scopes = "drive:drive drive:export:readonly offline_access"
+
+# WebDAV mount prefix ("/dav" or "/")
+dav_prefix = "/dav"
+
+# Optional Feishu Drive folder token to mount as the WebDAV root (defaults to My Space root)
+# root_folder_token = "fldcnxxxxxxxxxxxxxxxx"
+
+# Optional HTTP Basic Auth protecting the WebDAV endpoint
+# dav_username = "admin"
+# dav_password = "change-me"
+
+# Directory listing cache TTL in seconds (0 disables cache)
+cache_ttl_secs = 30
+
+# Probe binary file sizes via Range requests during PROPFIND (disable for faster listing of huge dirs)
+probe_file_size = true
+
+# How native Feishu cloud docs (docx/doc/sheet/bitable/mindnote/slides) are exposed:
+# "export"     -> export docx/doc/sheet/bitable on download; others as .url
+# "url"        -> expose all cloud docs as clickable .url files
+# "files_only" -> show only folders and uploaded binary files
+doc_mode = "export"
+
+# Set true to block all WebDAV write/delete/move/copy operations
+read_only = false
+
+# Serve HTML directory listing on browser GET requests to folders
+autoindex = true
+
+# Client-side QPS pacing for Feishu Drive APIs (max 5 QPS allowed by Feishu)
+max_qps = 4
+
+# Maximum single-file upload size in MiB (0 disables the limit)
+max_upload_mb = 2048
