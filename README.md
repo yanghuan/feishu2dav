@@ -106,6 +106,22 @@ cargo run -- serve
   rclone lsd :webdav: --webdav-url http://127.0.0.1:4918/dav
   ```
 
+## Docker 部署（GitHub Container Registry）
+
+GitHub Actions 会为 `main` 分支及 `v*` 标签自动构建多架构镜像（`linux/amd64`、`linux/arm64`）并发布至 `ghcr.io/yanghuan/feishu2dav`：
+
+```bash
+docker run -d \
+  --name feishu2dav \
+  -p 4918:4918 \
+  -v feishu2dav-data:/data \
+  -e FEISHU_APP_ID="cli_xxxxxxxxxxxxxxxx" \
+  -e FEISHU_APP_SECRET="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
+  ghcr.io/yanghuan/feishu2dav:latest
+```
+
+> 容器内默认监听 `0.0.0.0:4918`，OAuth 回调默认指向 `http://127.0.0.1:4918/oauth/callback`，令牌持久化在 `/data/feishu2dav-tokens.json`。如需挂载共享文件夹作为根目录，可追加 `-e FEISHU2DAV_ROOT_FOLDER_TOKEN="fldcnxxxxxxxxxxxxxxxx"`；局域网/公网部署请按实际访问域名设置 `-e FEISHU_REDIRECT_URI="https://your-domain/oauth/callback"`。
+
 ## 运行测试
 
 ```bash

@@ -1,0 +1,6 @@
+/target
+.git
+.github
+feishu2dav-tokens.json
+config.toml
+*.log
