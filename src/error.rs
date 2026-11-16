@@ -6,10 +6,11 @@ use thiserror::Error;
 
 pub type AppResult<T> = std::result::Result<T, AppError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DavHttpFault {
     TokenUnavailable,
     RateLimited,
+    ForbiddenWithMessage(String),
 }
 
 tokio::task_local! {
@@ -17,14 +18,14 @@ tokio::task_local! {
 }
 
 /// Runs `fut` inside a request-scoped fault tracker so WebDAV handlers can translate
-/// `TokenUnavailable` -> `401` and `RateLimited` -> `503 + Retry-After`.
+/// `TokenUnavailable` -> `401`, `RateLimited` -> `503 + Retry-After`, and `ForbiddenWithMessage` -> `403` body.
 pub async fn scope_dav_fault<F, R>(fut: F) -> (R, Option<DavHttpFault>)
 where
     F: Future<Output = R>,
 {
     let slot = Arc::new(Mutex::new(None));
     let res = DAV_HTTP_FAULT.scope(Arc::clone(&slot), fut).await;
-    let fault = *slot.lock().expect("dav fault lock poisoned");
+    let fault = slot.lock().expect("dav fault lock poisoned").take();
     (res, fault)
 }
 
@@ -34,6 +35,10 @@ fn record_dav_fault(fault: DavHttpFault) {
             *guard = Some(fault);
         }
     });
+}
+
+pub(crate) fn record_dav_forbidden(msg: impl Into<String>) {
+    record_dav_fault(DavHttpFault::ForbiddenWithMessage(msg.into()));
 }
 
 #[derive(Debug, Error)]
@@ -105,7 +110,7 @@ impl AppError {
             AppError::RateLimited => true,
             AppError::FeishuApi {
                 code, http_status, ..
-            } => *http_status == 429 || *code == 1061045,
+            } => *http_status == 429 || matches!(*code, 1061045 | 99991400 | 1770029),
             _ => false,
         }
     }
@@ -113,9 +118,9 @@ impl AppError {
     /// Maps known Feishu API error codes to richer semantic errors when possible.
     pub fn from_feishu_code(code: i64, msg: String, http_status: u16) -> Self {
         match code {
-            1061045 => AppError::RateLimited,
-            1062502 | 1061007 => AppError::NotFound(msg),
-            1061004 => AppError::Forbidden(msg),
+            1061045 | 99991400 | 1770029 => AppError::RateLimited,
+            1062502 | 1061007 | 1770002 => AppError::NotFound(msg),
+            1061004 | 1770032 | 99991672 => AppError::Forbidden(msg),
             _ if http_status == 429 => AppError::RateLimited,
             _ if http_status == 404 => AppError::NotFound(msg),
             _ if http_status == 403 => AppError::Forbidden(msg),
@@ -137,7 +142,12 @@ impl From<&AppError> for FsError {
                 record_dav_fault(DavHttpFault::TokenUnavailable);
                 FsError::Forbidden
             }
-            AppError::Forbidden(_) => FsError::Forbidden,
+            AppError::Forbidden(msg) => {
+                if !msg.is_empty() {
+                    record_dav_forbidden(format!("Feishu permission denied: {msg}"));
+                }
+                FsError::Forbidden
+            }
             AppError::NotImplemented(_) => FsError::NotImplemented,
             AppError::InvalidInput(_) => FsError::Forbidden,
             AppError::RateLimited => {

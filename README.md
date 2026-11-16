@@ -20,6 +20,7 @@
   - 支持文件重命名（通过飞书 `copy` + `delete`）、跨目录移动（`move`）、以及文件夹重命名（新建目标目录 + 迁移子节点 + 删除旧目录）。
 - **飞书云文档支持**（`--doc-mode` 可配置）：
   - `export`（默认）：`docx`/`doc` 自动按 `.docx` 导出，`sheet`/`bitable` 自动按 `.xlsx` 导出（懒加载导出任务 + 并发请求合并 + LRU 内存缓存），`slides`/`mindnote` 暴露为 `.url` 快捷方式；
+  - `markdown`（亦支持 `md`）：将新版飞书文档（`docx`）转换为可直接打开、展示精确大小并支持原地编辑保存的 `.md` 文件（基于 DocX Blocks API 双向互转，保持原 `document_id` 与协作权限不变，保存时采用“先追加新块、成功后再删旧块”策略以防中途失败清空原文档；若原文档含图片/画板/多维表格/高亮块/未知行内元素等不可无损转为 Markdown 的内容，保存覆盖时返回 `403 Forbidden` 与中文提示以防误删素材；新建不存在的 `.md` 文件按普通文件上传；注：在 `.md` 中新插入图片语法会退化为 alt 文本、原生 HTML/脚注不会被转为飞书块，且无并发版本合并控制，建议单写者顺序编辑；旧版 `doc` / 表格仍按 `.docx` / `.xlsx` 导出，演示文稿等仍暴露为 `.url`）；
   - `url`：所有云文档暴露为可点击的 `.url` 快捷方式；
   - `files_only`（亦支持 `files-only`）：仅展示普通二进制文件与文件夹。
 - **快捷方式透明解析**：自动识别飞书 Drive 中的 `shortcut` 节点并带环路检测。
@@ -37,6 +38,7 @@
 4. 在 **权限管理** 中为应用开通以下**用户身份权限**（User Scope）：
    - `drive:drive`（查看、评论、编辑和管理云空间中的所有文件）
    - `drive:export:readonly`（导出云文档，若使用 `--doc-mode export`）
+   - 若启用 `--doc-mode markdown` 直接读写飞书 `docx` 文档，请额外勾选 `docx:document:readonly` 与 `docx:document:write_only`（或直接勾选 `docx:document`）并在 `--scopes` 中包含它们（例如 `"drive:drive drive:export:readonly docx:document:readonly docx:document:write_only offline_access"`）
    - `offline_access`（获取 `refresh_token` 以支持自动续期）
    - 可选：`auth:user.id:read`（用于在状态页面显示当前授权用户的名称）
 5. 创建版本并**发布应用**（自建应用需管理员审核通过后权限才生效）。
@@ -78,8 +80,9 @@ cargo run -- serve
 | `--extra-folder-tokens`（兼容别名 `--mount-folder-tokens`） / `FEISHU2DAV_EXTRA_FOLDER_TOKENS` | 无 | 在默认根目录（或 `--root-folder-token`）下额外挂载的飞书文件夹 token 列表，支持逗号分隔或重复传参（自动从飞书获取文件夹名并按 300s TTL 缓存；无权/失效 token 会记录告警并跳过，面板状态随访问最多 300s 刷新，实时诊断请运行 `feishu2dav status`；挂载点本身禁止 `DELETE`/`MOVE`/`COPY`，内部文件/子目录可正常读写；传入空值 `""` 可清空配置文件中的同名列表） |
 | `--dav-username` / `FEISHU2DAV_USERNAME` | 无 | 可选 WebDAV Basic Auth 用户名 |
 | `--dav-password` / `FEISHU2DAV_PASSWORD` | 无 | 可选 WebDAV Basic Auth 密码 |
-| `--doc-mode` / `FEISHU2DAV_DOC_MODE` | `export` | 云文档模式：`export` / `url` / `files_only`（兼容 `files-only`） |
-| `--probe-file-size` / `FEISHU2DAV_PROBE_SIZE` | `true` | 是否在列目录时并发探测文件精确大小 |
+| `--doc-mode` / `FEISHU2DAV_DOC_MODE` | `export` | 云文档模式：`export` / `markdown`（别名 `md`）/ `url` / `files_only`（兼容 `files-only`） |
+| `--probe-file-size` / `FEISHU2DAV_PROBE_SIZE` | `true` | 是否在列目录时并发探测普通二进制文件精确大小 |
+| `--probe-markdown-size` / `FEISHU2DAV_PROBE_MARKDOWN_SIZE` | `true` | 是否在 `markdown` 模式下自动探测 `.md` 文档精确大小（每次 `PROPFIND` 列目录最多探测 5 个未缓存文档，已打开/缓存过的文档始终返回精确大小） |
 | `--cache-ttl-secs` / `FEISHU2DAV_CACHE_TTL` | `30` | 目录列表缓存 TTL（秒） |
 | `--read-only` / `FEISHU2DAV_READ_ONLY` | `false` | 只读模式（禁止写入/删除/移动/复制） |
 | `--autoindex` / `--no-autoindex` / `FEISHU2DAV_AUTOINDEX` | `true` | 是否在浏览器 GET WebDAV 目录时返回 HTML 文件列表 |

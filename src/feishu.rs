@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::error::{AppError, AppResult};
+use crate::markdown::{DescendantBatch, DocxBlock};
 use crate::oauth::OAuthManager;
 
 pub const UPLOAD_ALL_MAX_BYTES: usize = 20 * 1024 * 1024;
@@ -314,6 +315,16 @@ pub struct ExportedDoc {
     pub size: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ListDocxBlocksData {
+    #[serde(default)]
+    items: Vec<DocxBlock>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    page_token: Option<String>,
+}
+
 pub struct FeishuClient {
     oauth: Arc<OAuthManager>,
     http: Client,
@@ -453,17 +464,7 @@ impl FeishuClient {
     }
 
     pub async fn get_folder_meta(&self, folder_token: &str) -> AppResult<FolderMeta> {
-        let trimmed = folder_token.trim();
-        if trimmed.is_empty()
-            || trimmed.contains('/')
-            || trimmed.contains('?')
-            || trimmed.contains('#')
-            || trimmed.chars().any(char::is_whitespace)
-        {
-            return Err(AppError::InvalidInput(format!(
-                "invalid folder_token '{folder_token}'"
-            )));
-        }
+        let trimmed = validate_bare_token("folder_token", folder_token)?;
         let url = self.api_url(&format!(
             "/open-apis/drive/explorer/v2/folder/{trimmed}/meta"
         ));
@@ -1022,6 +1023,123 @@ impl FeishuClient {
         )
         .await
     }
+
+    pub async fn list_docx_blocks(&self, document_id: &str) -> AppResult<Vec<DocxBlock>> {
+        let doc_id = validate_bare_token("document_id", document_id)?;
+        let url = self.api_url(&format!("/open-apis/docx/v1/documents/{doc_id}/blocks"));
+        let mut all = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let token_param = page_token.clone();
+            let page: ListDocxBlocksData = self
+                .call_json(|client, bearer| {
+                    let mut req = client.get(&url).bearer_auth(bearer).query(&[
+                        ("page_size", "500"),
+                        ("document_revision_id", "-1"),
+                    ]);
+                    if let Some(ref pt) = token_param {
+                        req = req.query(&[("page_token", pt.as_str())]);
+                    }
+                    req
+                })
+                .await?;
+
+            all.extend(page.items);
+            if !page.has_more {
+                break;
+            }
+            match page.page_token {
+                Some(next) if !next.is_empty() => page_token = Some(next),
+                _ => break,
+            }
+        }
+
+        Ok(all)
+    }
+
+    pub async fn delete_docx_children_range(
+        &self,
+        document_id: &str,
+        start_index: usize,
+        end_index: usize,
+    ) -> AppResult<()> {
+        if start_index >= end_index {
+            return Ok(());
+        }
+        let doc_id = validate_bare_token("document_id", document_id)?;
+        #[derive(Serialize)]
+        struct Body {
+            start_index: usize,
+            end_index: usize,
+        }
+
+        let url = self.api_url(&format!(
+            "/open-apis/docx/v1/documents/{doc_id}/blocks/{doc_id}/children/batch_delete"
+        ));
+        let _: Option<serde_json::Value> = self
+            .call_json_opt(|client, bearer| {
+                client
+                    .delete(&url)
+                    .bearer_auth(bearer)
+                    .query(&[("document_revision_id", "-1")])
+                    .json(&Body {
+                        start_index,
+                        end_index,
+                    })
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_docx_descendants(
+        &self,
+        document_id: &str,
+        index: isize,
+        batch: &DescendantBatch,
+    ) -> AppResult<()> {
+        if batch.children_id.is_empty() {
+            return Ok(());
+        }
+        let doc_id = validate_bare_token("document_id", document_id)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            index: isize,
+            children_id: &'a [String],
+            descendants: &'a [serde_json::Value],
+        }
+
+        let url = self.api_url(&format!(
+            "/open-apis/docx/v1/documents/{doc_id}/blocks/{doc_id}/descendant"
+        ));
+        let _: Option<serde_json::Value> = self
+            .call_json_opt(|client, bearer| {
+                client
+                    .post(&url)
+                    .bearer_auth(bearer)
+                    .query(&[("document_revision_id", "-1")])
+                    .json(&Body {
+                        index,
+                        children_id: &batch.children_id,
+                        descendants: &batch.descendants,
+                    })
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+fn validate_bare_token<'a>(kind: &str, raw: &'a str) -> AppResult<&'a str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::InvalidInput(format!("invalid {kind} '{raw}'")));
+    }
+    Ok(trimmed)
 }
 
 enum RetryStep<T> {

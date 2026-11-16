@@ -14,16 +14,21 @@ use tempfile::NamedTempFile;
 use tracing::{debug, trace, warn};
 
 use crate::cache::{
-    DriveCache, FolderMountStatus, NodeKind, VirtualNode, VirtualZeroEntry, build_virtual_nodes,
-    dedup_name, sanitize_segment,
+    CachedExport, DriveCache, FolderMountStatus, NodeKind, VirtualNode, VirtualZeroEntry,
+    build_virtual_nodes, dedup_name, sanitize_segment,
 };
 use crate::config::DocMode;
-use crate::error::AppError;
+use crate::error::{AppError, AppResult, record_dav_forbidden};
 use crate::feishu::{DownloadBody, FeishuClient, FolderMeta, UploadSource};
+use crate::markdown::{
+    docx_blocks_to_markdown, format_unconvertible_forbidden_message,
+    markdown_to_docx_descendant_batches,
+};
 use crate::oauth::unix_now;
 
 const MAX_MEMORY_WRITE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_AUTO_PROBE_PER_DIR: usize = 50;
+const MAX_MARKDOWN_PROBE_PER_DIR: usize = 5;
 const CONCURRENT_PROBES_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +36,7 @@ pub(crate) enum PathKind {
     Missing,
     MountPoint,
     Folder,
-    ImmutableCloudDoc,
+    CloudDocTarget,
     MutableFile,
 }
 
@@ -41,6 +46,7 @@ pub struct DavFsOptions {
     pub extra_folder_tokens: Vec<String>,
     pub doc_mode: DocMode,
     pub probe_file_size: bool,
+    pub probe_markdown_size: bool,
     pub read_only: bool,
     pub max_upload_bytes: Option<u64>,
 }
@@ -53,6 +59,7 @@ pub struct FeishuDavFs {
     extra_folder_tokens: Vec<String>,
     doc_mode: DocMode,
     probe_file_size: bool,
+    probe_markdown_size: bool,
     read_only: bool,
     max_upload_bytes: Option<u64>,
 }
@@ -66,6 +73,7 @@ impl FeishuDavFs {
             extra_folder_tokens: opts.extra_folder_tokens,
             doc_mode: opts.doc_mode,
             probe_file_size: opts.probe_file_size,
+            probe_markdown_size: opts.probe_markdown_size,
             read_only: opts.read_only,
             max_upload_bytes: opts.max_upload_bytes,
         }
@@ -289,8 +297,8 @@ impl FeishuDavFs {
                     Ok(PathKind::MountPoint)
                 } else if node.is_dir() {
                     Ok(PathKind::Folder)
-                } else if node.is_immutable_cloud_doc() {
-                    Ok(PathKind::ImmutableCloudDoc)
+                } else if node.is_cloud_doc() {
+                    Ok(PathKind::CloudDocTarget)
                 } else {
                     Ok(PathKind::MutableFile)
                 }
@@ -351,25 +359,43 @@ impl FeishuDavFs {
         node: &mut VirtualNode,
         probe_if_missing: bool,
     ) -> FsResult<FeishuMetaData> {
-        if node.known_size.is_none()
-            && probe_if_missing
-            && matches!(node.kind, NodeKind::BinaryFile)
-        {
-            if let Some(cached) = self.cache.get_size(&node.token, node.modified_time).await {
-                node.known_size = Some(cached);
-            } else {
-                let sz = self
-                    .client
-                    .probe_file_size(&node.token)
-                    .await
-                    .map_err(FsError::from)?;
-                self.cache
-                    .put_size(&node.token, node.modified_time, sz)
-                    .await;
-                node.known_size = Some(sz);
+        if node.known_size.is_none() {
+            match node.kind {
+                NodeKind::BinaryFile => {
+                    if let Some(cached) = self.cache.get_size(&node.token, node.modified_time).await {
+                        node.known_size = Some(cached);
+                    } else if probe_if_missing {
+                        let sz = self
+                            .client
+                            .probe_file_size(&node.token)
+                            .await
+                            .map_err(FsError::from)?;
+                        self.cache
+                            .put_size(&node.token, node.modified_time, sz)
+                            .await;
+                        node.known_size = Some(sz);
+                    }
+                }
+                NodeKind::MarkdownDoc => {
+                    if let Some(cached) = self
+                        .cache
+                        .get_markdown(&node.token, node.modified_time)
+                        .await
+                    {
+                        node.known_size = Some(cached.size);
+                    } else if probe_if_missing {
+                        let md = self.render_or_cached_markdown(node).await?;
+                        node.known_size = Some(md.size);
+                    }
+                }
+                _ => {}
             }
         }
         Ok(FeishuMetaData::from_node(node))
+    }
+
+    async fn render_or_cached_markdown(&self, node: &VirtualNode) -> FsResult<CachedExport> {
+        fetch_and_cache_markdown(&self.client, &self.cache, &node.token, node.modified_time).await
     }
 
     async fn export_or_cached_doc(
@@ -465,10 +491,20 @@ impl DavFileSystem for FeishuDavFs {
                 if !options.create && existing.is_none() {
                     return Err(FsError::NotFound);
                 }
-                if let Some(ref node) = existing
-                    && (node.is_dir() || node.is_immutable_cloud_doc())
-                {
-                    return Err(FsError::Forbidden);
+                if let Some(ref node) = existing {
+                    if node.is_dir() || node.is_immutable_cloud_doc() {
+                        return Err(FsError::Forbidden);
+                    }
+                    if matches!(node.kind, NodeKind::MarkdownDoc) {
+                        let md = self.render_or_cached_markdown(node).await?;
+                        if !md.unconvertible_reasons.is_empty() {
+                            record_dav_forbidden(format_unconvertible_forbidden_message(
+                                &node.dav_name,
+                                &md.unconvertible_reasons,
+                            ));
+                            return Err(FsError::Forbidden);
+                        }
+                    }
                 }
 
                 let mut spool = WriteSpool::new(self.max_upload_bytes);
@@ -479,7 +515,8 @@ impl DavFileSystem for FeishuDavFs {
                 if let Some(ref node) = existing
                     && !options.truncate
                 {
-                    let existing_len = spool_existing_node(&self.client, node, &mut spool).await?;
+                    let existing_len =
+                        spool_existing_node(&self.client, &self.cache, node, &mut spool).await?;
                     if options.append {
                         cursor = existing_len;
                     }
@@ -533,6 +570,12 @@ impl DavFileSystem for FeishuDavFs {
                     let meta = FeishuMetaData::from_node(&node);
                     Ok(Box::new(MemoryReadFile::new(bytes, meta)) as Box<dyn DavFile>)
                 }
+                NodeKind::MarkdownDoc => {
+                    let md = self.render_or_cached_markdown(&node).await?;
+                    node.known_size = Some(md.size);
+                    let meta = FeishuMetaData::from_node(&node);
+                    Ok(Box::new(MemoryReadFile::new(md.data, meta)) as Box<dyn DavFile>)
+                }
                 NodeKind::BinaryFile => {
                     // On read open, strictly require exact size so GET never serves 200 OK with 0 bytes
                     let meta = self.ensure_node_metadata(&mut node, true).await?;
@@ -560,40 +603,97 @@ impl DavFileSystem for FeishuDavFs {
                 return Err(FsError::Forbidden);
             }
 
+            #[derive(Clone, Copy)]
+            enum ProbeKind {
+                Binary,
+                Markdown,
+            }
+
             let mut nodes = self.list_folder_nodes(&folder.token).await?;
             let mut probed_any = false;
             let mut probe_targets = Vec::new();
+            let mut md_probe_count = 0usize;
 
             for (idx, node) in nodes.iter_mut().enumerate() {
-                if node.known_size.is_none() && matches!(node.kind, NodeKind::BinaryFile) {
-                    if let Some(cached) = self.cache.get_size(&node.token, node.modified_time).await {
-                        node.known_size = Some(cached);
-                        probed_any = true;
-                    } else if self.probe_file_size && probe_targets.len() < MAX_AUTO_PROBE_PER_DIR {
-                        probe_targets.push((idx, node.token.clone(), node.modified_time));
+                if node.known_size.is_some() {
+                    continue;
+                }
+                match node.kind {
+                    NodeKind::BinaryFile => {
+                        if let Some(cached) =
+                            self.cache.get_size(&node.token, node.modified_time).await
+                        {
+                            node.known_size = Some(cached);
+                            probed_any = true;
+                        } else if self.probe_file_size
+                            && probe_targets.len() < MAX_AUTO_PROBE_PER_DIR
+                        {
+                            probe_targets.push((
+                                ProbeKind::Binary,
+                                idx,
+                                node.token.clone(),
+                                node.modified_time,
+                            ));
+                        }
                     }
+                    NodeKind::MarkdownDoc => {
+                        if let Some(cached) = self
+                            .cache
+                            .get_markdown(&node.token, node.modified_time)
+                            .await
+                        {
+                            node.known_size = Some(cached.size);
+                            probed_any = true;
+                        } else if self.probe_markdown_size
+                            && md_probe_count < MAX_MARKDOWN_PROBE_PER_DIR
+                            && probe_targets.len() < MAX_AUTO_PROBE_PER_DIR
+                        {
+                            md_probe_count += 1;
+                            probe_targets.push((
+                                ProbeKind::Markdown,
+                                idx,
+                                node.token.clone(),
+                                node.modified_time,
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
             }
 
             if !probe_targets.is_empty() {
                 let probe_results: Vec<_> = stream::iter(probe_targets)
-                    .map(|(idx, token, modified_time)| async move {
-                        let res = self.client.probe_file_size(&token).await;
-                        (idx, token, modified_time, res)
+                    .map(|(kind, idx, token, modified_time)| async move {
+                        let res = match kind {
+                            ProbeKind::Binary => self.client.probe_file_size(&token).await,
+                            ProbeKind::Markdown => {
+                                fetch_and_cache_markdown_app(
+                                    &self.client,
+                                    &self.cache,
+                                    &token,
+                                    modified_time,
+                                )
+                                .await
+                                .map(|m| m.size)
+                            }
+                        };
+                        (kind, idx, token, modified_time, res)
                     })
                     .buffer_unordered(CONCURRENT_PROBES_LIMIT)
                     .collect()
                     .await;
 
-                for (idx, token, modified_time, res) in probe_results {
+                for (kind, idx, token, modified_time, res) in probe_results {
                     match res {
                         Ok(sz) => {
-                            self.cache.put_size(&token, modified_time, sz).await;
+                            if matches!(kind, ProbeKind::Binary) {
+                                self.cache.put_size(&token, modified_time, sz).await;
+                            }
                             nodes[idx].known_size = Some(sz);
                             probed_any = true;
                         }
                         Err(err) => {
-                            warn!(token = %token, "failed to probe file size during PROPFIND: {err}");
+                            warn!(token = %token, "failed to probe node size during PROPFIND: {err}");
                         }
                     }
                 }
@@ -626,9 +726,12 @@ impl DavFileSystem for FeishuDavFs {
         Box::pin(async move {
             trace!(?path, "FeishuDavFs::metadata");
             let mut node = self.resolve_path(path).await?;
-            let meta = self
-                .ensure_node_metadata(&mut node, self.probe_file_size)
-                .await?;
+            let probe = match node.kind {
+                NodeKind::BinaryFile => self.probe_file_size,
+                NodeKind::MarkdownDoc => self.probe_markdown_size,
+                _ => false,
+            };
+            let meta = self.ensure_node_metadata(&mut node, probe).await?;
             Ok(Box::new(meta) as Box<dyn DavMetaData>)
         })
     }
@@ -716,7 +819,7 @@ impl DavFileSystem for FeishuDavFs {
 
             let dest_existing = match self.resolve_path(to).await {
                 Ok(n) => {
-                    if n.is_dir() || from_node.is_dir() != n.is_dir() || n.is_immutable_cloud_doc() {
+                    if n.is_dir() || from_node.is_dir() != n.is_dir() || n.is_cloud_doc() {
                         return Err(FsError::Forbidden);
                     }
                     Some(n)
@@ -853,7 +956,7 @@ impl DavFileSystem for FeishuDavFs {
 
             let dest_existing = match self.resolve_path(to).await {
                 Ok(n) => {
-                    if n.is_dir() || n.is_immutable_cloud_doc() {
+                    if n.is_dir() || n.is_cloud_doc() {
                         return Err(FsError::Forbidden);
                     }
                     Some(n)
@@ -912,16 +1015,21 @@ impl DavFileSystem for FeishuDavFs {
 fn feishu_target_name(from_node: &VirtualNode, dest_dav_name: &str) -> String {
     match &from_node.kind {
         NodeKind::ExportDoc { export_ext } => {
-            let suffix = format!(".{export_ext}");
-            if dest_dav_name.to_ascii_lowercase().ends_with(&suffix)
-                && !from_node.raw_name.to_ascii_lowercase().ends_with(&suffix)
-            {
-                dest_dav_name[..dest_dav_name.len() - suffix.len()].to_string()
-            } else {
-                dest_dav_name.to_string()
-            }
+            strip_virtual_extension(&from_node.raw_name, dest_dav_name, export_ext)
         }
+        NodeKind::MarkdownDoc => strip_virtual_extension(&from_node.raw_name, dest_dav_name, "md"),
         _ => dest_dav_name.to_string(),
+    }
+}
+
+fn strip_virtual_extension(raw_name: &str, dest_dav_name: &str, ext: &str) -> String {
+    let suffix = format!(".{ext}");
+    if dest_dav_name.to_ascii_lowercase().ends_with(&suffix)
+        && !raw_name.to_ascii_lowercase().ends_with(&suffix)
+    {
+        dest_dav_name[..dest_dav_name.len() - suffix.len()].to_string()
+    } else {
+        dest_dav_name.to_string()
     }
 }
 
@@ -1428,6 +1536,23 @@ impl DavFile for FeishuWriteFile {
             }
 
             let source = self.spool.prepare_upload_source().await?;
+
+            if let Some(ref old) = self.existing
+                && matches!(old.kind, NodeKind::MarkdownDoc)
+            {
+                flush_markdown_update(
+                    &self.client,
+                    &self.cache,
+                    &self.parent_token,
+                    old,
+                    &source,
+                )
+                .await?;
+                self.flushed = true;
+                self.dirty = false;
+                return Ok(());
+            }
+
             let size = source.len();
 
             if size == 0 {
@@ -1520,13 +1645,164 @@ impl DavFile for FeishuWriteFile {
     }
 }
 
+async fn fetch_and_cache_markdown_app(
+    client: &FeishuClient,
+    cache: &DriveCache,
+    token: &str,
+    modified_time: Option<u64>,
+) -> AppResult<CachedExport> {
+    if let Some(cached) = cache.get_markdown(token, modified_time).await {
+        return Ok(cached);
+    }
+
+    let lock = cache.acquire_export_lock(token, modified_time, "md").await;
+    let _guard = lock.lock().await;
+
+    if let Some(cached) = cache.get_markdown(token, modified_time).await {
+        return Ok(cached);
+    }
+
+    let blocks = client.list_docx_blocks(token).await?;
+    let rendered = docx_blocks_to_markdown(token, &blocks);
+    let data = Bytes::from(rendered.markdown.into_bytes());
+    let size = data.len() as u64;
+    let reasons = rendered.unconvertible_reasons;
+    cache
+        .put_markdown(token, modified_time, data.clone(), size, reasons.clone())
+        .await;
+
+    Ok(CachedExport::new(data, size, reasons))
+}
+
+async fn fetch_and_cache_markdown(
+    client: &FeishuClient,
+    cache: &DriveCache,
+    token: &str,
+    modified_time: Option<u64>,
+) -> FsResult<CachedExport> {
+    fetch_and_cache_markdown_app(client, cache, token, modified_time)
+        .await
+        .map_err(|e| FsError::from(&e))
+}
+
+async fn flush_markdown_update(
+    client: &FeishuClient,
+    cache: &DriveCache,
+    parent_token: &str,
+    existing: &VirtualNode,
+    source: &UploadSource,
+) -> FsResult<()> {
+    let len = usize::try_from(source.len()).map_err(|_| FsError::TooLarge)?;
+    let raw = source
+        .read_slice(0, len)
+        .await
+        .map_err(FsError::from)?;
+    let md_text = std::str::from_utf8(&raw).map_err(|_| {
+        record_dav_forbidden("Markdown 文档保存失败：仅支持 UTF-8 编码文本，已保留原飞书文档内容。");
+        FsError::Forbidden
+    })?;
+
+    // Re-check live blocks directly before writing anything so rich media added in Feishu
+    // after the last directory cache refresh is never destroyed.
+    let live_blocks = client
+        .list_docx_blocks(&existing.token)
+        .await
+        .map_err(FsError::from)?;
+    let current = docx_blocks_to_markdown(&existing.token, &live_blocks);
+    if !current.unconvertible_reasons.is_empty() {
+        record_dav_forbidden(format_unconvertible_forbidden_message(
+            &existing.dav_name,
+            &current.unconvertible_reasons,
+        ));
+        return Err(FsError::Forbidden);
+    }
+
+    let batches = markdown_to_docx_descendant_batches(md_text).map_err(|msg| {
+        record_dav_forbidden(msg);
+        FsError::Forbidden
+    })?;
+
+    let old_count = current.root_children_count;
+    if batches.is_empty() {
+        if old_count > 0
+            && let Err(err) = client
+                .delete_docx_children_range(&existing.token, 0, old_count)
+                .await
+        {
+            cache.invalidate_markdown(&existing.token).await;
+            cache.invalidate_dir(parent_token).await;
+            return Err(FsError::from(&err));
+        }
+        cache.invalidate_markdown(&existing.token).await;
+        cache.invalidate_dir(parent_token).await;
+        return Ok(());
+    }
+
+    // Append all new blocks first so any insertion failure leaves the original blocks intact.
+    let mut appended_top_level = 0usize;
+    for batch in &batches {
+        if let Err(err) = client
+            .insert_docx_descendants(&existing.token, -1, batch)
+            .await
+        {
+            if appended_top_level > 0
+                && let Err(cleanup_err) = client
+                    .delete_docx_children_range(
+                        &existing.token,
+                        old_count,
+                        old_count + appended_top_level,
+                    )
+                    .await
+            {
+                warn!(
+                    token = %existing.token,
+                    error = %cleanup_err,
+                    "failed to roll back partially appended docx blocks after descendant failure"
+                );
+            }
+            cache.invalidate_markdown(&existing.token).await;
+            cache.invalidate_dir(parent_token).await;
+            return Err(FsError::from(&err));
+        }
+        appended_top_level += batch.children_id.len();
+    }
+
+    if old_count > 0
+        && let Err(err) = client
+            .delete_docx_children_range(&existing.token, 0, old_count)
+            .await
+    {
+        warn!(
+            token = %existing.token,
+            error = %err,
+            "new markdown blocks appended, but failed to delete old leading blocks"
+        );
+        cache.invalidate_markdown(&existing.token).await;
+        cache.invalidate_dir(parent_token).await;
+        return Err(FsError::from(&err));
+    }
+
+    cache.invalidate_markdown(&existing.token).await;
+    cache.invalidate_dir(parent_token).await;
+    Ok(())
+}
+
 async fn spool_existing_node(
     client: &FeishuClient,
+    cache: &DriveCache,
     node: &VirtualNode,
     spool: &mut WriteSpool,
 ) -> FsResult<u64> {
     match &node.kind {
         NodeKind::VirtualZeroFile => Ok(0),
+        NodeKind::MarkdownDoc => {
+            let md = fetch_and_cache_markdown(client, cache, &node.token, node.modified_time).await?;
+            let len = md.data.len() as u64;
+            if !md.data.is_empty() {
+                spool.write_at(0, md.data).await?;
+            }
+            Ok(len)
+        }
         NodeKind::BinaryFile => {
             let (mut body, _) = client
                 .open_download_stream(&node.token, 0)

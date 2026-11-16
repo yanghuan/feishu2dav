@@ -43,6 +43,7 @@ pub fn build_app_state(config: Config, oauth: Arc<OAuthManager>, http: reqwest::
             extra_folder_tokens: config.extra_folder_tokens.clone(),
             doc_mode: config.doc_mode,
             probe_file_size: config.probe_file_size,
+            probe_markdown_size: config.probe_markdown_size,
             read_only: config.read_only,
             max_upload_bytes: config.max_upload_bytes(),
         },
@@ -449,7 +450,7 @@ async fn handle_dav(State(state): State<AppState>, req: Request) -> Response {
                 Ok(
                     kind @ (PathKind::MountPoint
                     | PathKind::Folder
-                    | PathKind::ImmutableCloudDoc),
+                    | PathKind::CloudDocTarget),
                 ) => {
                     let overwrite = !req
                         .headers()
@@ -467,7 +468,7 @@ async fn handle_dav(State(state): State<AppState>, req: Request) -> Response {
                         PathKind::MountPoint | PathKind::Folder => {
                             "Cannot overwrite existing directory via MOVE/COPY"
                         }
-                        PathKind::ImmutableCloudDoc => {
+                        PathKind::CloudDocTarget => {
                             "Cannot overwrite native Feishu cloud document or shortcut"
                         }
                         PathKind::Missing | PathKind::MutableFile => unreachable!(),
@@ -488,7 +489,9 @@ async fn handle_dav(State(state): State<AppState>, req: Request) -> Response {
     if let Some(fault) = fault {
         let expected_status = match fault {
             DavHttpFault::RateLimited => StatusCode::BAD_GATEWAY,
-            DavHttpFault::TokenUnavailable => StatusCode::FORBIDDEN,
+            DavHttpFault::TokenUnavailable | DavHttpFault::ForbiddenWithMessage(_) => {
+                StatusCode::FORBIDDEN
+            }
         };
         if resp.status() == expected_status {
             return dav_fault_response(fault);
@@ -527,6 +530,12 @@ fn dav_fault_response(fault: DavHttpFault) -> Response {
         DavHttpFault::TokenUnavailable => (
             StatusCode::UNAUTHORIZED,
             "Feishu OAuth authorization required or expired; please authorize at /oauth/login",
+        )
+            .into_response(),
+        DavHttpFault::ForbiddenWithMessage(msg) => (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            msg,
         )
             .into_response(),
     }

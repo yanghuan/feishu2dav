@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,18 +60,22 @@ pub struct MockFeishuState {
     pub refresh_calls: AtomicUsize,
     pub root_meta_calls: AtomicUsize,
     pub folder_meta_calls: AtomicUsize,
+    pub docx_blocks_calls: AtomicUsize,
+    pub docx_descendant_calls: AtomicUsize,
     pub force_expired_once: bool,
     pub force_rate_limit_once: bool,
     pub force_rate_limit_forever: bool,
     pub force_folder_meta_rate_limit: bool,
     pub ignore_range_on_download: bool,
     pub reject_zero_byte_upload: bool,
+    pub fail_docx_descendant_after: Option<usize>,
     root_token: String,
     pub nodes: HashMap<String, MockNode>,
     uploads: HashMap<String, MockUploadSession>,
     tasks: HashMap<String, usize>,
     pub exports: HashMap<String, MockExportJob>,
     exported_blobs: HashMap<String, Vec<u8>>,
+    pub docx_blocks: HashMap<String, Vec<Value>>,
     next_id: usize,
 }
 
@@ -163,6 +167,37 @@ impl MockFeishuState {
             },
         );
 
+        let mut docx_blocks = HashMap::new();
+        docx_blocks.insert(
+            "doc_init".to_string(),
+            vec![
+                json!({
+                    "block_id": "doc_init",
+                    "block_type": 1,
+                    "parent_id": "",
+                    "children": ["blk_h1", "blk_p1"]
+                }),
+                json!({
+                    "block_id": "blk_h1",
+                    "block_type": 3,
+                    "parent_id": "doc_init",
+                    "children": [],
+                    "heading1": {
+                        "elements": [{ "text_run": { "content": "Design Spec" } }]
+                    }
+                }),
+                json!({
+                    "block_id": "blk_p1",
+                    "block_type": 2,
+                    "parent_id": "doc_init",
+                    "children": [],
+                    "text": {
+                        "elements": [{ "text_run": { "content": "Initial spec body" } }]
+                    }
+                }),
+            ],
+        );
+
         Self {
             app_id: "cli_test_app".to_string(),
             app_secret: "secret_test_123".to_string(),
@@ -172,18 +207,22 @@ impl MockFeishuState {
             refresh_calls: AtomicUsize::new(0),
             root_meta_calls: AtomicUsize::new(0),
             folder_meta_calls: AtomicUsize::new(0),
+            docx_blocks_calls: AtomicUsize::new(0),
+            docx_descendant_calls: AtomicUsize::new(0),
             force_expired_once: false,
             force_rate_limit_once: false,
             force_rate_limit_forever: false,
             force_folder_meta_rate_limit: false,
             ignore_range_on_download: false,
             reject_zero_byte_upload: true,
+            fail_docx_descendant_after: None,
             root_token: "fld_root".to_string(),
             nodes,
             uploads: HashMap::new(),
             tasks: HashMap::new(),
             exports: HashMap::new(),
             exported_blobs: HashMap::new(),
+            docx_blocks,
             next_id: 100,
         }
     }
@@ -289,6 +328,18 @@ pub async fn spawn_mock_feishu() -> (String, SharedMock) {
         .route(
             "/open-apis/drive/v1/export_tasks/file/{token}/download",
             get(mock_download_export),
+        )
+        .route(
+            "/open-apis/docx/v1/documents/{doc_id}/blocks",
+            get(mock_list_docx_blocks),
+        )
+        .route(
+            "/open-apis/docx/v1/documents/{doc_id}/blocks/{block_id}/children/batch_delete",
+            delete(mock_batch_delete_docx_children),
+        )
+        .route(
+            "/open-apis/docx/v1/documents/{doc_id}/blocks/{block_id}/descendant",
+            post(mock_insert_docx_descendants),
         )
         .layer(DefaultBodyLimit::disable())
         .with_state(Arc::clone(&state));
@@ -1146,6 +1197,263 @@ async fn mock_download_export(
     Response::new(axum::body::Body::from(bytes))
 }
 
+async fn mock_list_docx_blocks(
+    State(state): State<SharedMock>,
+    headers: HeaderMap,
+    AxumPath(doc_id): AxumPath<String>,
+) -> Response {
+    let mut s = state.lock().await;
+    if let Some(resp) = s.check_auth(&headers) {
+        return resp;
+    }
+    s.docx_blocks_calls.fetch_add(1, Ordering::Relaxed);
+    let Some(blocks) = s.docx_blocks.get(&doc_id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": 1770002, "msg": "document not found"})),
+        )
+            .into_response();
+    };
+    Json(json!({
+        "code": 0,
+        "msg": "success",
+        "data": {
+            "items": blocks,
+            "has_more": false,
+            "page_token": ""
+        }
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct MockBatchDeleteReq {
+    start_index: usize,
+    end_index: usize,
+}
+
+async fn mock_batch_delete_docx_children(
+    State(state): State<SharedMock>,
+    headers: HeaderMap,
+    AxumPath((doc_id, block_id)): AxumPath<(String, String)>,
+    Json(req): Json<MockBatchDeleteReq>,
+) -> Response {
+    let mut s = state.lock().await;
+    if let Some(resp) = s.check_auth(&headers) {
+        return resp;
+    }
+    let Some(blocks) = s.docx_blocks.get_mut(&doc_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": 1770002, "msg": "document not found"})),
+        )
+            .into_response();
+    };
+    let Some(parent) = blocks
+        .iter_mut()
+        .find(|b| b.get("block_id").and_then(Value::as_str) == Some(block_id.as_str()))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": 1770001, "msg": "parent block not found"})),
+        )
+            .into_response();
+    };
+    let children = parent
+        .get_mut("children")
+        .and_then(Value::as_array_mut)
+        .expect("children array");
+    if req.start_index > req.end_index || req.end_index > children.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"code": 1770001, "msg": "invalid index range"})),
+        )
+            .into_response();
+    }
+    children.drain(req.start_index..req.end_index);
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::from([doc_id.clone()]);
+    let by_id: HashMap<String, Vec<String>> = blocks
+        .iter()
+        .filter_map(|b| {
+            let bid = b.get("block_id").and_then(Value::as_str)?.to_string();
+            let ch = b
+                .get("children")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((bid, ch))
+        })
+        .collect();
+    while let Some(cur) = queue.pop_front() {
+        if reachable.insert(cur.clone())
+            && let Some(kids) = by_id.get(&cur)
+        {
+            queue.extend(kids.iter().cloned());
+        }
+    }
+    blocks.retain(|b| {
+        b.get("block_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| reachable.contains(id))
+    });
+    if let Some(node) = s.nodes.get_mut(&doc_id) {
+        node.modified_time += 1;
+    }
+    Json(json!({
+        "code": 0,
+        "msg": "success",
+        "data": { "document_revision_id": 2 }
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct MockDescendantReq {
+    index: isize,
+    children_id: Vec<String>,
+    descendants: Vec<Value>,
+}
+
+fn remap_descendant_block_ids(block: &mut Value, doc_id: &str, id_map: &HashMap<String, String>) {
+    if let Some(obj) = block.as_object_mut() {
+        if let Some(old_id) = obj
+            .get("block_id")
+            .and_then(Value::as_str)
+            .and_then(|id| id_map.get(id))
+            .cloned()
+        {
+            obj.insert("block_id".to_string(), json!(old_id));
+        }
+        if let Some(parent) = obj.get("parent_id").and_then(Value::as_str) {
+            let mapped = id_map
+                .get(parent)
+                .map(String::as_str)
+                .unwrap_or(if parent == "document" { doc_id } else { parent })
+                .to_string();
+            obj.insert("parent_id".to_string(), json!(mapped));
+        }
+        if let Some(children) = obj.get_mut("children").and_then(Value::as_array_mut) {
+            for cid in children {
+                if let Some(s) = cid.as_str()
+                    && let Some(mapped) = id_map.get(s)
+                {
+                    *cid = json!(mapped);
+                }
+            }
+        }
+        if let Some(cells) = obj
+            .get_mut("table")
+            .and_then(|t| t.get_mut("cells"))
+            .and_then(Value::as_array_mut)
+        {
+            for cid in cells {
+                if let Some(s) = cid.as_str()
+                    && let Some(mapped) = id_map.get(s)
+                {
+                    *cid = json!(mapped);
+                }
+            }
+        }
+    }
+}
+
+async fn mock_insert_docx_descendants(
+    State(state): State<SharedMock>,
+    headers: HeaderMap,
+    AxumPath((doc_id, block_id)): AxumPath<(String, String)>,
+    Json(req): Json<MockDescendantReq>,
+) -> Response {
+    let mut s = state.lock().await;
+    if let Some(resp) = s.check_auth(&headers) {
+        return resp;
+    }
+    s.docx_descendant_calls.fetch_add(1, Ordering::Relaxed);
+    if let Some(remaining) = s.fail_docx_descendant_after {
+        if remaining == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"code": 1770001, "msg": "injected descendant failure"})),
+            )
+                .into_response();
+        }
+        s.fail_docx_descendant_after = Some(remaining - 1);
+    }
+    if req.descendants.len() > 1000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"code": 1770001, "msg": "too many blocks"})),
+        )
+            .into_response();
+    }
+    if !s.docx_blocks.contains_key(&doc_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": 1770002, "msg": "document not found"})),
+        )
+            .into_response();
+    }
+    let mut id_map = HashMap::new();
+    for desc in &req.descendants {
+        if let Some(old_id) = desc.get("block_id").and_then(Value::as_str) {
+            let new_id = s.alloc_id("srv_b");
+            id_map.insert(old_id.to_string(), new_id);
+        }
+    }
+    let mapped_children: Vec<String> = req
+        .children_id
+        .iter()
+        .map(|cid| id_map.get(cid).cloned().unwrap_or_else(|| cid.clone()))
+        .collect();
+    let top_level: HashSet<&str> = mapped_children.iter().map(String::as_str).collect();
+    let mut mapped_descendants = req.descendants;
+    for desc in &mut mapped_descendants {
+        remap_descendant_block_ids(desc, &doc_id, &id_map);
+        if let Some(obj) = desc.as_object_mut()
+            && obj
+                .get("block_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| top_level.contains(id))
+            && !obj.contains_key("parent_id")
+        {
+            obj.insert("parent_id".to_string(), json!(doc_id));
+        }
+    }
+
+    let blocks = s.docx_blocks.get_mut(&doc_id).expect("doc exists");
+    let parent = blocks
+        .iter_mut()
+        .find(|b| b.get("block_id").and_then(Value::as_str) == Some(block_id.as_str()))
+        .expect("parent block");
+    let children = parent
+        .get_mut("children")
+        .and_then(Value::as_array_mut)
+        .expect("children array");
+    let insert_at = if req.index < 0 || (req.index as usize) >= children.len() {
+        children.len()
+    } else {
+        req.index as usize
+    };
+    for (offset, cid) in mapped_children.iter().enumerate() {
+        children.insert(insert_at + offset, json!(cid));
+    }
+    blocks.extend(mapped_descendants);
+    if let Some(node) = s.nodes.get_mut(&doc_id) {
+        node.modified_time += 1;
+    }
+    Json(json!({
+        "code": 0,
+        "msg": "success",
+        "data": { "document_revision_id": 3 }
+    }))
+    .into_response()
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1161,6 +1469,7 @@ pub struct TestServerOpts<'a> {
     pub extra_folder_tokens: Vec<String>,
     pub redirect_uri: Option<String>,
     pub doc_mode: DocMode,
+    pub probe_markdown_size: bool,
     pub read_only: bool,
     pub max_upload_mb: u64,
     pub cache_ttl_secs: u64,
@@ -1176,6 +1485,7 @@ impl<'a> Default for TestServerOpts<'a> {
             extra_folder_tokens: Vec::new(),
             redirect_uri: None,
             doc_mode: DocMode::Export,
+            probe_markdown_size: true,
             read_only: false,
             max_upload_mb: 2048,
             cache_ttl_secs: 30,
@@ -1232,6 +1542,7 @@ pub async fn spawn_test_server_with(
         dav_password: opts.basic_auth.map(|(_, p)| p.to_string()),
         cache_ttl_secs: opts.cache_ttl_secs,
         probe_file_size: true,
+        probe_markdown_size: opts.probe_markdown_size,
         doc_mode: opts.doc_mode,
         read_only: opts.read_only,
         autoindex: true,

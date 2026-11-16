@@ -39,8 +39,12 @@ cache_ttl_secs = 30
 # Probe binary file sizes via Range requests during PROPFIND (disable for faster listing of huge dirs)
 probe_file_size = true
 
+# Probe Markdown docx sizes via Blocks API during PROPFIND (up to 5 uncached docs per directory)
+probe_markdown_size = true
+
 # How native Feishu cloud docs (docx/doc/sheet/bitable/mindnote/slides) are exposed:
 # "export"     -> export docx/doc/sheet/bitable on download; others as .url
+# "markdown"   -> expose docx as readable & editable .md (blocks API); others export/.url
 # "url"        -> expose all cloud docs as clickable .url files
 # "files_only" -> show only folders and uploaded binary files
 doc_mode = "export"

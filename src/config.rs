@@ -22,6 +22,11 @@ pub enum DocMode {
     /// non-exportable cloud docs (slides/mindnote) are exposed as .url shortcuts.
     #[default]
     Export,
+    /// Expose upgraded Feishu cloud documents (`docx`) as directly readable and editable `.md` Markdown files;
+    /// legacy `doc`/`sheet`/`bitable` still export normally and non-exportable docs remain `.url` shortcuts.
+    #[value(name = "markdown", alias = "md")]
+    #[serde(alias = "md")]
+    Markdown,
     /// Expose all Feishu cloud documents as clickable .url InternetShortcut files.
     Url,
     /// Hide Feishu cloud documents and expose only uploaded binary files and folders.
@@ -107,6 +112,10 @@ pub struct Cli {
     #[arg(long, env = "FEISHU2DAV_PROBE_SIZE", global = true)]
     pub probe_file_size: Option<bool>,
 
+    /// Whether to probe Markdown docx sizes during PROPFIND (up to 5 uncached docs per directory)
+    #[arg(long, env = "FEISHU2DAV_PROBE_MARKDOWN_SIZE", global = true)]
+    pub probe_markdown_size: Option<bool>,
+
     /// How native Feishu cloud documents (docx/sheet/bitable/mindnote/slides) are exposed
     #[arg(long, value_enum, env = "FEISHU2DAV_DOC_MODE", global = true)]
     pub doc_mode: Option<DocMode>,
@@ -164,6 +173,7 @@ struct FileConfig {
     dav_password: Option<String>,
     cache_ttl_secs: Option<u64>,
     probe_file_size: Option<bool>,
+    probe_markdown_size: Option<bool>,
     doc_mode: Option<DocMode>,
     read_only: Option<bool>,
     autoindex: Option<bool>,
@@ -188,6 +198,7 @@ pub struct Config {
     pub dav_password: Option<String>,
     pub cache_ttl_secs: u64,
     pub probe_file_size: bool,
+    pub probe_markdown_size: bool,
     pub doc_mode: DocMode,
     pub read_only: bool,
     pub autoindex: bool,
@@ -328,6 +339,10 @@ impl Config {
             .probe_file_size
             .or(file_cfg.probe_file_size)
             .unwrap_or(true);
+        let probe_markdown_size = cli
+            .probe_markdown_size
+            .or(file_cfg.probe_markdown_size)
+            .unwrap_or(true);
         let doc_mode = cli.doc_mode.or(file_cfg.doc_mode).unwrap_or_default();
         let read_only = cli.read_only.or(file_cfg.read_only).unwrap_or(false);
         let autoindex = if cli.no_autoindex {
@@ -357,6 +372,7 @@ impl Config {
             dav_password,
             cache_ttl_secs,
             probe_file_size,
+            probe_markdown_size,
             doc_mode,
             read_only,
             autoindex,
@@ -535,6 +551,8 @@ mod tests {
             "128",
             "--autoindex",
             "false",
+            "--probe-markdown-size",
+            "false",
         ])
         .unwrap();
         let cfg = Config::load_from_cli(&cli_snake).unwrap();
@@ -543,9 +561,15 @@ mod tests {
         assert_eq!(cfg.max_upload_mb, 128);
         assert_eq!(cfg.max_upload_bytes(), Some(128 * 1024 * 1024));
         assert!(!cfg.autoindex);
+        assert!(!cfg.probe_markdown_size);
 
         let cli_kebab = Cli::try_parse_from(["feishu2dav", "--doc-mode", "files-only"]).unwrap();
         assert_eq!(cli_kebab.doc_mode, Some(DocMode::FilesOnly));
+
+        let cli_md = Cli::try_parse_from(["feishu2dav", "--doc-mode", "markdown"]).unwrap();
+        assert_eq!(cli_md.doc_mode, Some(DocMode::Markdown));
+        let cli_md_alias = Cli::try_parse_from(["feishu2dav", "--doc-mode", "md"]).unwrap();
+        assert_eq!(cli_md_alias.doc_mode, Some(DocMode::Markdown));
     }
 
     #[test]

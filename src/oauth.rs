@@ -595,6 +595,7 @@ mod tests {
             dav_password: None,
             cache_ttl_secs: 30,
             probe_file_size: true,
+            probe_markdown_size: true,
             doc_mode: DocMode::Export,
             read_only: false,
             autoindex: true,

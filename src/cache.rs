@@ -20,6 +20,7 @@ pub enum NodeKind {
     Folder,
     BinaryFile,
     ExportDoc { export_ext: &'static str },
+    MarkdownDoc,
     UrlShortcut { url: String },
     VirtualZeroFile,
 }
@@ -52,12 +53,21 @@ impl VirtualNode {
         matches!(self.kind, NodeKind::Folder)
     }
 
-    /// Returns true for native Feishu cloud documents/links exposed as exported or `.url` files.
-    /// Overwriting these via WebDAV must be rejected to avoid deleting the user's cloud document.
+    /// Returns true for read-only Feishu cloud documents/links exposed as exported or `.url` files.
+    /// Overwriting these via WebDAV PUT must be rejected to avoid deleting the user's cloud document.
     pub fn is_immutable_cloud_doc(&self) -> bool {
         matches!(
             self.kind,
             NodeKind::ExportDoc { .. } | NodeKind::UrlShortcut { .. }
+        )
+    }
+
+    /// Returns true for any native Feishu cloud document/link (`export`, `markdown`, or `.url`),
+    /// which must never be blindly replaced via WebDAV MOVE/COPY Destination overwrite.
+    pub fn is_cloud_doc(&self) -> bool {
+        matches!(
+            self.kind,
+            NodeKind::ExportDoc { .. } | NodeKind::MarkdownDoc | NodeKind::UrlShortcut { .. }
         )
     }
 
@@ -107,11 +117,25 @@ struct ExportCacheKey {
 }
 
 #[derive(Debug, Clone)]
-struct CachedExport {
-    data: Bytes,
-    size: u64,
+pub struct CachedExport {
+    pub data: Bytes,
+    pub size: u64,
+    pub unconvertible_reasons: Vec<String>,
     cached_at: Instant,
     last_used: Instant,
+}
+
+impl CachedExport {
+    pub fn new(data: Bytes, size: u64, unconvertible_reasons: Vec<String>) -> Self {
+        let now = Instant::now();
+        Self {
+            data,
+            size,
+            unconvertible_reasons,
+            cached_at: now,
+            last_used: now,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +360,26 @@ impl DriveCache {
         modified_time: Option<u64>,
         ext: &'static str,
     ) -> Option<(Bytes, u64)> {
+        self.get_cached_export_entry(token, modified_time, ext)
+            .await
+            .map(|e| (e.data, e.size))
+    }
+
+    pub async fn get_markdown(
+        &self,
+        token: &str,
+        modified_time: Option<u64>,
+    ) -> Option<CachedExport> {
+        self.get_cached_export_entry(token, modified_time, "md")
+            .await
+    }
+
+    async fn get_cached_export_entry(
+        &self,
+        token: &str,
+        modified_time: Option<u64>,
+        ext: &'static str,
+    ) -> Option<CachedExport> {
         let key = ExportCacheKey {
             token: token.to_string(),
             modified_time,
@@ -345,7 +389,7 @@ impl DriveCache {
         let entry = guard.get_mut(&key)?;
         if entry.cached_at.elapsed() <= EXPORT_CACHE_TTL {
             entry.last_used = Instant::now();
-            Some((entry.data.clone(), entry.size))
+            Some(entry.clone())
         } else {
             guard.remove(&key);
             None
@@ -359,6 +403,38 @@ impl DriveCache {
         ext: &'static str,
         data: Bytes,
         size: u64,
+    ) {
+        self.put_cached_export_entry(token, modified_time, ext, data, size, Vec::new())
+            .await;
+    }
+
+    pub async fn put_markdown(
+        &self,
+        token: &str,
+        modified_time: Option<u64>,
+        data: Bytes,
+        size: u64,
+        unconvertible_reasons: Vec<String>,
+    ) {
+        self.put_cached_export_entry(token, modified_time, "md", data, size, unconvertible_reasons)
+            .await;
+    }
+
+    pub async fn invalidate_markdown(&self, token: &str) {
+        self.exports
+            .write()
+            .await
+            .retain(|k, _| !(k.token == token && k.ext == "md"));
+    }
+
+    async fn put_cached_export_entry(
+        &self,
+        token: &str,
+        modified_time: Option<u64>,
+        ext: &'static str,
+        data: Bytes,
+        size: u64,
+        unconvertible_reasons: Vec<String>,
     ) {
         if data.len() > MAX_EXPORT_CACHE_BYTES / 2 {
             return;
@@ -388,6 +464,7 @@ impl DriveCache {
             CachedExport {
                 data,
                 size,
+                unconvertible_reasons,
                 cached_at: now,
                 last_used: now,
             },
@@ -459,8 +536,23 @@ pub async fn build_virtual_nodes(
         let (kind, base_name) = match target_type.as_str() {
             "folder" => (NodeKind::Folder, sanitize_segment(&item.name)),
             "file" => (NodeKind::BinaryFile, sanitize_segment(&item.name)),
-            "docx" | "doc" => match doc_mode {
+            "docx" => match doc_mode {
                 DocMode::Export => (
+                    NodeKind::ExportDoc { export_ext: "docx" },
+                    ensure_extension(&sanitize_segment(&item.name), "docx"),
+                ),
+                DocMode::Markdown => (
+                    NodeKind::MarkdownDoc,
+                    ensure_extension(&sanitize_segment(&item.name), "md"),
+                ),
+                DocMode::Url => (
+                    NodeKind::UrlShortcut { url: fallback_url },
+                    ensure_extension(&sanitize_segment(&item.name), "url"),
+                ),
+                DocMode::FilesOnly => continue,
+            },
+            "doc" => match doc_mode {
+                DocMode::Export | DocMode::Markdown => (
                     NodeKind::ExportDoc { export_ext: "docx" },
                     ensure_extension(&sanitize_segment(&item.name), "docx"),
                 ),
@@ -471,7 +563,7 @@ pub async fn build_virtual_nodes(
                 DocMode::FilesOnly => continue,
             },
             "sheet" | "bitable" => match doc_mode {
-                DocMode::Export => (
+                DocMode::Export | DocMode::Markdown => (
                     NodeKind::ExportDoc { export_ext: "xlsx" },
                     ensure_extension(&sanitize_segment(&item.name), "xlsx"),
                 ),
@@ -482,7 +574,7 @@ pub async fn build_virtual_nodes(
                 DocMode::FilesOnly => continue,
             },
             _ => match doc_mode {
-                DocMode::Export | DocMode::Url => (
+                DocMode::Export | DocMode::Markdown | DocMode::Url => (
                     NodeKind::UrlShortcut { url: fallback_url },
                     ensure_extension(&sanitize_segment(&item.name), "url"),
                 ),
@@ -531,6 +623,10 @@ pub async fn build_virtual_nodes(
                 .get_export(&entry.target_token, entry.item.modified_time, export_ext)
                 .await
                 .map(|(_, s)| s),
+            NodeKind::MarkdownDoc => cache
+                .get_markdown(&entry.target_token, entry.item.modified_time)
+                .await
+                .map(|e| e.size),
         };
 
         nodes.push(VirtualNode {
