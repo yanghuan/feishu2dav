@@ -13,10 +13,13 @@ use futures_util::stream::{self, StreamExt};
 use tempfile::NamedTempFile;
 use tracing::{debug, trace, warn};
 
-use crate::cache::{DriveCache, NodeKind, VirtualNode, VirtualZeroEntry, build_virtual_nodes};
+use crate::cache::{
+    DriveCache, FolderMountStatus, NodeKind, VirtualNode, VirtualZeroEntry, build_virtual_nodes,
+    dedup_name, sanitize_segment,
+};
 use crate::config::DocMode;
 use crate::error::AppError;
-use crate::feishu::{DownloadBody, FeishuClient, UploadSource};
+use crate::feishu::{DownloadBody, FeishuClient, FolderMeta, UploadSource};
 use crate::oauth::unix_now;
 
 const MAX_MEMORY_WRITE_BYTES: usize = 4 * 1024 * 1024;
@@ -24,11 +27,22 @@ const MAX_AUTO_PROBE_PER_DIR: usize = 50;
 const CONCURRENT_PROBES_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DestinationKind {
+pub(crate) enum PathKind {
     Missing,
+    MountPoint,
     Folder,
     ImmutableCloudDoc,
     MutableFile,
+}
+
+#[derive(Debug, Clone)]
+pub struct DavFsOptions {
+    pub root_folder_token: Option<String>,
+    pub extra_folder_tokens: Vec<String>,
+    pub doc_mode: DocMode,
+    pub probe_file_size: bool,
+    pub read_only: bool,
+    pub max_upload_bytes: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -36,6 +50,7 @@ pub struct FeishuDavFs {
     client: Arc<FeishuClient>,
     cache: Arc<DriveCache>,
     root_folder_token: Option<String>,
+    extra_folder_tokens: Vec<String>,
     doc_mode: DocMode,
     probe_file_size: bool,
     read_only: bool,
@@ -43,23 +58,16 @@ pub struct FeishuDavFs {
 }
 
 impl FeishuDavFs {
-    pub fn new(
-        client: Arc<FeishuClient>,
-        cache: Arc<DriveCache>,
-        root_folder_token: Option<String>,
-        doc_mode: DocMode,
-        probe_file_size: bool,
-        read_only: bool,
-        max_upload_bytes: Option<u64>,
-    ) -> Self {
+    pub fn new(client: Arc<FeishuClient>, cache: Arc<DriveCache>, opts: DavFsOptions) -> Self {
         Self {
             client,
             cache,
-            root_folder_token,
-            doc_mode,
-            probe_file_size,
-            read_only,
-            max_upload_bytes,
+            root_folder_token: opts.root_folder_token,
+            extra_folder_tokens: opts.extra_folder_tokens,
+            doc_mode: opts.doc_mode,
+            probe_file_size: opts.probe_file_size,
+            read_only: opts.read_only,
+            max_upload_bytes: opts.max_upload_bytes,
         }
     }
 
@@ -93,18 +101,201 @@ impl FeishuDavFs {
         Ok(nodes)
     }
 
-    pub(crate) async fn inspect_destination(&self, path: &DavPath) -> FsResult<DestinationKind> {
+    async fn get_folder_meta_cached(&self, folder_token: &str) -> FsResult<Option<FolderMeta>> {
+        if let Some(cached) = self.cache.get_folder_meta(folder_token).await {
+            return Ok(Some(cached));
+        }
+        match self.client.get_folder_meta(folder_token).await {
+            Ok(meta) => {
+                self.cache.put_folder_meta(folder_token, meta.clone()).await;
+                self.cache
+                    .set_mount_status(
+                        folder_token,
+                        FolderMountStatus::Mounted {
+                            name: meta.name.clone(),
+                            token: meta.token.clone(),
+                        },
+                    )
+                    .await;
+                Ok(Some(meta))
+            }
+            Err(err)
+                if matches!(err, AppError::TokenUnavailable(_))
+                    || err.is_token_invalid()
+                    || err.is_rate_limited() =>
+            {
+                Err(FsError::from(&err))
+            }
+            Err(err) => {
+                warn!(
+                    folder_token = %folder_token,
+                    "skipping extra mounted folder: {err}"
+                );
+                self.cache
+                    .set_mount_status(
+                        folder_token,
+                        FolderMountStatus::Failed {
+                            error: err.to_string(),
+                        },
+                    )
+                    .await;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn merge_extra_root_mounts(
+        &self,
+        base_root_token: &str,
+        mut base_nodes: Vec<VirtualNode>,
+    ) -> FsResult<Vec<VirtualNode>> {
+        if self.extra_folder_tokens.is_empty() {
+            return Ok(base_nodes);
+        }
+
+        let mut used_names: HashSet<String> =
+            base_nodes.iter().map(|n| n.dav_name.clone()).collect();
+        let mut seen_folder_tokens: HashSet<String> = base_nodes
+            .iter()
+            .filter(|n| n.is_dir())
+            .map(|n| n.token.clone())
+            .collect();
+        seen_folder_tokens.insert(base_root_token.to_string());
+
+        let mut candidates = Vec::new();
+        for tok in &self.extra_folder_tokens {
+            if seen_folder_tokens.contains(tok.as_str()) {
+                let name = if tok == base_root_token {
+                    "/ (当前根目录)".to_string()
+                } else {
+                    base_nodes
+                        .iter()
+                        .find(|n| n.is_dir() && n.token == *tok)
+                        .map(|n| n.dav_name.clone())
+                        .unwrap_or_else(|| tok.clone())
+                };
+                self.cache
+                    .set_mount_status(
+                        tok,
+                        FolderMountStatus::Mounted {
+                            name,
+                            token: tok.clone(),
+                        },
+                    )
+                    .await;
+            } else {
+                candidates.push(tok.clone());
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(base_nodes);
+        }
+
+        let resolved: Vec<(String, FsResult<Option<FolderMeta>>)> = stream::iter(candidates)
+            .map(|tok| async move {
+                let res = self.get_folder_meta_cached(&tok).await;
+                (tok, res)
+            })
+            .buffered(CONCURRENT_PROBES_LIMIT)
+            .collect()
+            .await;
+
+        let fallback_ts = self.cache.started_unix_secs();
+
+        for (configured_tok, res) in resolved {
+            let Some(meta) = res? else {
+                continue;
+            };
+            let target_token = if meta.token.trim().is_empty() {
+                configured_tok
+            } else {
+                meta.token
+            };
+            if !seen_folder_tokens.insert(target_token.clone()) {
+                continue;
+            }
+            let raw_name = if meta.name.trim().is_empty() {
+                target_token.clone()
+            } else {
+                meta.name
+            };
+            let base_name = sanitize_segment(&raw_name);
+            let dav_name = dedup_name(&base_name, &target_token, &mut used_names);
+            let created_time = meta.created_time.or(meta.modified_time).or(Some(fallback_ts));
+            let modified_time = meta.modified_time.or(meta.created_time).or(Some(fallback_ts));
+            base_nodes.push(VirtualNode {
+                dav_name,
+                raw_name,
+                token: target_token.clone(),
+                feishu_type: "folder".to_string(),
+                entry_token: target_token,
+                entry_type: "folder".to_string(),
+                parent_token: base_root_token.to_string(),
+                kind: NodeKind::Folder,
+                is_mount: true,
+                created_time,
+                modified_time,
+                known_size: Some(0),
+            });
+        }
+
+        Ok(base_nodes)
+    }
+
+    async fn list_nodes_at(
+        &self,
+        folder_token: &str,
+        include_extra_mounts: bool,
+    ) -> FsResult<Vec<VirtualNode>> {
+        let nodes = self.list_folder_nodes(folder_token).await?;
+        if include_extra_mounts {
+            self.merge_extra_root_mounts(folder_token, nodes).await
+        } else {
+            Ok(nodes)
+        }
+    }
+
+    async fn descend_folders(
+        &self,
+        base_root_token: &str,
+        folder_segments: &[String],
+    ) -> FsResult<String> {
+        let mut current_folder = base_root_token.to_string();
+        let mut visited = HashSet::new();
+        visited.insert(current_folder.clone());
+
+        for (idx, seg) in folder_segments.iter().enumerate() {
+            let nodes = self.list_nodes_at(&current_folder, idx == 0).await?;
+            let Some(node) = nodes.into_iter().find(|n| n.dav_name == *seg) else {
+                return Err(FsError::NotFound);
+            };
+            if !node.is_dir() {
+                return Err(FsError::Forbidden);
+            }
+            if !visited.insert(node.token.clone()) {
+                return Err(FsError::LoopDetected);
+            }
+            current_folder = node.token;
+        }
+
+        Ok(current_folder)
+    }
+
+    pub(crate) async fn inspect_path(&self, path: &DavPath) -> FsResult<PathKind> {
         match self.resolve_path(path).await {
             Ok(node) => {
-                if node.is_dir() {
-                    Ok(DestinationKind::Folder)
+                if node.is_mount {
+                    Ok(PathKind::MountPoint)
+                } else if node.is_dir() {
+                    Ok(PathKind::Folder)
                 } else if node.is_immutable_cloud_doc() {
-                    Ok(DestinationKind::ImmutableCloudDoc)
+                    Ok(PathKind::ImmutableCloudDoc)
                 } else {
-                    Ok(DestinationKind::MutableFile)
+                    Ok(PathKind::MutableFile)
                 }
             }
-            Err(FsError::NotFound) => Ok(DestinationKind::Missing),
+            Err(FsError::NotFound) => Ok(PathKind::Missing),
             Err(e) => Err(e),
         }
     }
@@ -114,6 +305,7 @@ impl FeishuDavFs {
         let root_token = self.root_token().await?;
 
         if segments.is_empty() {
+            let fallback_ts = self.cache.started_unix_secs();
             return Ok(VirtualNode {
                 dav_name: String::new(),
                 raw_name: String::new(),
@@ -123,35 +315,23 @@ impl FeishuDavFs {
                 entry_type: "folder".to_string(),
                 parent_token: String::new(),
                 kind: NodeKind::Folder,
-                created_time: None,
-                modified_time: None,
+                is_mount: false,
+                created_time: Some(fallback_ts),
+                modified_time: Some(fallback_ts),
                 known_size: Some(0),
             });
         }
 
-        let mut current_folder = root_token;
-        let mut visited = HashSet::new();
-        visited.insert(current_folder.clone());
-
-        for (idx, seg) in segments.iter().enumerate() {
-            let is_last = idx + 1 == segments.len();
-            let nodes = self.list_folder_nodes(&current_folder).await?;
-            let Some(node) = nodes.into_iter().find(|n| n.dav_name == *seg) else {
-                return Err(FsError::NotFound);
-            };
-            if is_last {
-                return Ok(node);
-            }
-            if !node.is_dir() {
-                return Err(FsError::Forbidden);
-            }
-            if !visited.insert(node.token.clone()) {
-                return Err(FsError::LoopDetected);
-            }
-            current_folder = node.token;
-        }
-
-        Err(FsError::NotFound)
+        let parent_segments = &segments[..segments.len() - 1];
+        let target_name = &segments[segments.len() - 1];
+        let parent_folder = self.descend_folders(&root_token, parent_segments).await?;
+        let nodes = self
+            .list_nodes_at(&parent_folder, parent_segments.is_empty())
+            .await?;
+        nodes
+            .into_iter()
+            .find(|n| n.dav_name == *target_name)
+            .ok_or(FsError::NotFound)
     }
 
     async fn resolve_parent(&self, path: &DavPath) -> FsResult<(String, String)> {
@@ -159,27 +339,11 @@ impl FeishuDavFs {
         if segments.is_empty() {
             return Err(FsError::Forbidden);
         }
-        let name = segments[segments.len() - 1].clone();
-        let parent_segments = &segments[..segments.len() - 1];
-        let mut current_folder = self.root_token().await?;
-        let mut visited = HashSet::new();
-        visited.insert(current_folder.clone());
-
-        for seg in parent_segments {
-            let nodes = self.list_folder_nodes(&current_folder).await?;
-            let Some(node) = nodes.into_iter().find(|n| n.dav_name == *seg) else {
-                return Err(FsError::NotFound);
-            };
-            if !node.is_dir() {
-                return Err(FsError::Forbidden);
-            }
-            if !visited.insert(node.token.clone()) {
-                return Err(FsError::LoopDetected);
-            }
-            current_folder = node.token;
-        }
-
-        Ok((current_folder, name))
+        let root_token = self.root_token().await?;
+        let parent_folder = self
+            .descend_folders(&root_token, &segments[..segments.len() - 1])
+            .await?;
+        Ok((parent_folder, segments[segments.len() - 1].clone()))
     }
 
     async fn ensure_node_metadata(
@@ -390,6 +554,7 @@ impl DavFileSystem for FeishuDavFs {
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         Box::pin(async move {
             trace!(?path, "FeishuDavFs::read_dir");
+            let segments = path_segments(path)?;
             let folder = self.resolve_path(path).await?;
             if !folder.is_dir() {
                 return Err(FsError::Forbidden);
@@ -436,6 +601,10 @@ impl DavFileSystem for FeishuDavFs {
 
             if probed_any {
                 self.cache.put_dir(&folder.token, nodes.clone()).await;
+            }
+
+            if segments.is_empty() {
+                nodes = self.merge_extra_root_mounts(&folder.token, nodes).await?;
             }
 
             let entries: Vec<FsResult<Box<dyn DavDirEntry>>> = nodes
@@ -501,7 +670,7 @@ impl DavFileSystem for FeishuDavFs {
                 return Err(FsError::Forbidden);
             }
             let node = self.resolve_path(path).await?;
-            if !node.is_dir() {
+            if !node.is_dir() || node.is_mount {
                 return Err(FsError::Forbidden);
             }
 
@@ -540,6 +709,9 @@ impl DavFileSystem for FeishuDavFs {
             }
 
             let from_node = self.resolve_path(from).await?;
+            if from_node.is_mount {
+                return Err(FsError::Forbidden);
+            }
             let (dest_parent_token, dest_name) = self.resolve_parent(to).await?;
 
             let dest_existing = match self.resolve_path(to).await {

@@ -59,9 +59,11 @@ pub struct MockFeishuState {
     pub token_seq: usize,
     pub refresh_calls: AtomicUsize,
     pub root_meta_calls: AtomicUsize,
+    pub folder_meta_calls: AtomicUsize,
     pub force_expired_once: bool,
     pub force_rate_limit_once: bool,
     pub force_rate_limit_forever: bool,
+    pub force_folder_meta_rate_limit: bool,
     pub ignore_range_on_download: bool,
     pub reject_zero_byte_upload: bool,
     root_token: String,
@@ -169,9 +171,11 @@ impl MockFeishuState {
             token_seq: 1,
             refresh_calls: AtomicUsize::new(0),
             root_meta_calls: AtomicUsize::new(0),
+            folder_meta_calls: AtomicUsize::new(0),
             force_expired_once: false,
             force_rate_limit_once: false,
             force_rate_limit_forever: false,
+            force_folder_meta_rate_limit: false,
             ignore_range_on_download: false,
             reject_zero_byte_upload: true,
             root_token: "fld_root".to_string(),
@@ -246,6 +250,10 @@ pub async fn spawn_mock_feishu() -> (String, SharedMock) {
         .route(
             "/open-apis/drive/explorer/v2/root_folder/meta",
             get(mock_root_meta),
+        )
+        .route(
+            "/open-apis/drive/explorer/v2/folder/{token}/meta",
+            get(mock_folder_meta),
         )
         .route("/open-apis/drive/v1/files", get(mock_list_files))
         .route(
@@ -411,6 +419,69 @@ async fn mock_root_meta(State(state): State<SharedMock>, headers: HeaderMap) -> 
             "token": s.root_token,
             "id": s.root_token,
             "user_id": "ou_alice_123"
+        }
+    }))
+    .into_response()
+}
+
+async fn mock_folder_meta(
+    State(state): State<SharedMock>,
+    headers: HeaderMap,
+    AxumPath(token): AxumPath<String>,
+) -> Response {
+    let mut s = state.lock().await;
+    if let Some(resp) = s.check_auth(&headers) {
+        return resp;
+    }
+    if s.force_folder_meta_rate_limit {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"code": 1061045, "msg": "folder meta rate limit"})),
+        )
+            .into_response();
+    }
+    s.folder_meta_calls.fetch_add(1, Ordering::SeqCst);
+    if token == s.root_token {
+        return Json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "id": s.root_token,
+                "name": "Root",
+                "token": s.root_token,
+                "createUid": "ou_alice_123",
+                "editUid": "ou_alice_123",
+                "parentId": "0",
+                "ownUid": "ou_alice_123"
+            }
+        }))
+        .into_response();
+    }
+    let Some(node) = s.nodes.get(&token) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": 1062502, "msg": "folder not found"})),
+        )
+            .into_response();
+    };
+    if node.file_type != "folder" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": 1062502, "msg": "not a folder"})),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "code": 0,
+        "msg": "success",
+        "data": {
+            "id": node.token,
+            "name": node.name,
+            "token": node.token,
+            "createUid": "ou_alice_123",
+            "editUid": "ou_alice_123",
+            "parentId": "0",
+            "ownUid": "ou_alice_123"
         }
     }))
     .into_response()
@@ -1087,6 +1158,7 @@ pub struct TestServerOpts<'a> {
     pub preauth_token: Option<TokenSet>,
     pub dav_prefix: &'a str,
     pub root_folder_token: Option<String>,
+    pub extra_folder_tokens: Vec<String>,
     pub redirect_uri: Option<String>,
     pub doc_mode: DocMode,
     pub read_only: bool,
@@ -1101,6 +1173,7 @@ impl<'a> Default for TestServerOpts<'a> {
             preauth_token: None,
             dav_prefix: "/dav",
             root_folder_token: None,
+            extra_folder_tokens: Vec::new(),
             redirect_uri: None,
             doc_mode: DocMode::Export,
             read_only: false,
@@ -1154,6 +1227,7 @@ pub async fn spawn_test_server_with(
         scopes: "drive:drive drive:export:readonly offline_access".to_string(),
         dav_prefix: opts.dav_prefix.to_string(),
         root_folder_token: opts.root_folder_token,
+        extra_folder_tokens: opts.extra_folder_tokens,
         dav_username: opts.basic_auth.map(|(u, _)| u.to_string()),
         dav_password: opts.basic_auth.map(|(_, p)| p.to_string()),
         cache_ttl_secs: opts.cache_ttl_secs,

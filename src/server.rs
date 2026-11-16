@@ -15,12 +15,12 @@ use dav_server::fs::FsError;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::cache::DriveCache;
+use crate::cache::{DriveCache, FolderMountStatus};
 use crate::config::Config;
 use crate::error::{DavHttpFault, scope_dav_fault};
 use crate::feishu::FeishuClient;
 use crate::oauth::OAuthManager;
-use crate::webdav::{DestinationKind, FeishuDavFs};
+use crate::webdav::{DavFsOptions, FeishuDavFs, PathKind};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,11 +38,14 @@ pub fn build_app_state(config: Config, oauth: Arc<OAuthManager>, http: reqwest::
     let fs = FeishuDavFs::new(
         Arc::clone(&client),
         Arc::clone(&cache),
-        config.root_folder_token.clone(),
-        config.doc_mode,
-        config.probe_file_size,
-        config.read_only,
-        config.max_upload_bytes(),
+        DavFsOptions {
+            root_folder_token: config.root_folder_token.clone(),
+            extra_folder_tokens: config.extra_folder_tokens.clone(),
+            doc_mode: config.doc_mode,
+            probe_file_size: config.probe_file_size,
+            read_only: config.read_only,
+            max_upload_bytes: config.max_upload_bytes(),
+        },
     );
 
     let mut builder = DavHandler::builder()
@@ -159,6 +162,29 @@ async fn dashboard(State(state): State<AppState>) -> impl IntoResponse {
         Some(tok) => format!("<code>{}</code> (自定义根目录)", html_escape(tok)),
         None => "我的空间 (默认)".to_string(),
     };
+    let extra_mounts_row = if state.config.extra_folder_tokens.is_empty() {
+        String::new()
+    } else {
+        let mut items = Vec::with_capacity(state.config.extra_folder_tokens.len());
+        for tok in &state.config.extra_folder_tokens {
+            let status_html = match state.cache.get_mount_status(tok).await {
+                Some(FolderMountStatus::Mounted { name, .. }) => format!(
+                    "<span class='badge ok'>已挂载 ({})</span>",
+                    html_escape(&name)
+                ),
+                Some(FolderMountStatus::Failed { error }) => format!(
+                    "<span class='badge err'>挂载失败 ({})</span>",
+                    html_escape(&error)
+                ),
+                None => "<span class='badge warn'>待首次访问验证</span>".to_string(),
+            };
+            items.push(format!("<div><code>{}</code> {status_html}</div>", html_escape(tok)));
+        }
+        format!(
+            "<tr><td>根目录额外挂载</td><td>{}<div style='font-size:12px;color:#646a73;margin-top:4px'>状态随访问按最多 300s 缓存刷新；实时诊断请运行 <code>feishu2dav status</code></div></td></tr>",
+            items.join("")
+        )
+    };
 
     let html = format!(
         r#"<!doctype html>
@@ -196,6 +222,7 @@ async fn dashboard(State(state): State<AppState>) -> impl IntoResponse {
       <tr><td>Refresh Token</td><td>{}</td></tr>
       <tr><td>WebDAV 挂载路径</td><td><code>http://{}{}</code></td></tr>
       <tr><td>Drive 根目录</td><td>{root_folder_html}</td></tr>
+      {extra_mounts_row}
       <tr><td>文档模式</td><td><code>{:?}</code> (只读: <code>{}</code>)</td></tr>
     </table>
     <a class="btn" href="/oauth/login">使用飞书账号授权 / 重新授权</a>
@@ -363,11 +390,31 @@ async fn handle_dav(State(state): State<AppState>, req: Request) -> Response {
             }
         }
 
+        // Prevent dav-server from recursively deleting, moving, or tree-copying a virtual root mount folder
+        // (RFC4918 DELETE walks children before remove_dir; COPY walks children to copy into My Space).
+        let method = req.method().as_str();
+        if !state.config.extra_folder_tokens.is_empty()
+            && matches!(method, "DELETE" | "MOVE" | "COPY")
+            && let Ok(src_path) = parse_request_dav_path(req.uri(), &state.config.dav_prefix)
+        {
+            let (check_res, fault) = scope_dav_fault(state.fs.inspect_path(&src_path)).await;
+            match check_res {
+                Ok(PathKind::MountPoint) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "Cannot delete, move, or copy configured extra mount folder",
+                    )
+                        .into_response();
+                }
+                Ok(_) => {}
+                Err(err) => return dav_error_response(err, fault, "Request path"),
+            }
+        }
+
         // dav-server pre-deletes an existing Destination via remove_file before calling
         // rename/copy. Fail-closed on missing/invalid Destination and intercept MOVE/COPY
         // targeting an existing folder or ExportDoc/UrlShortcut here so explicit DELETE
         // works while MOVE/COPY cannot wipe out directories or cloud documents.
-        let method = req.method().as_str();
         if method == "MOVE" || method == "COPY" {
             let Some(raw_dest) = req
                 .headers()
@@ -397,10 +444,13 @@ async fn handle_dav(State(state): State<AppState>, req: Request) -> Response {
                 }
             };
 
-            let (check_res, fault) =
-                scope_dav_fault(state.fs.inspect_destination(&dest_path)).await;
+            let (check_res, fault) = scope_dav_fault(state.fs.inspect_path(&dest_path)).await;
             match check_res {
-                Ok(kind @ (DestinationKind::Folder | DestinationKind::ImmutableCloudDoc)) => {
+                Ok(
+                    kind @ (PathKind::MountPoint
+                    | PathKind::Folder
+                    | PathKind::ImmutableCloudDoc),
+                ) => {
                     let overwrite = !req
                         .headers()
                         .get("overwrite")
@@ -414,37 +464,20 @@ async fn handle_dav(State(state): State<AppState>, req: Request) -> Response {
                             .into_response();
                     }
                     let msg = match kind {
-                        DestinationKind::Folder => {
+                        PathKind::MountPoint | PathKind::Folder => {
                             "Cannot overwrite existing directory via MOVE/COPY"
                         }
-                        DestinationKind::ImmutableCloudDoc => {
+                        PathKind::ImmutableCloudDoc => {
                             "Cannot overwrite native Feishu cloud document or shortcut"
                         }
-                        DestinationKind::Missing | DestinationKind::MutableFile => unreachable!(),
+                        PathKind::Missing | PathKind::MutableFile => unreachable!(),
                     };
                     return (StatusCode::FORBIDDEN, msg).into_response();
                 }
-                Ok(DestinationKind::Missing | DestinationKind::MutableFile) => {}
+                Ok(PathKind::Missing | PathKind::MutableFile) => {}
                 Err(err) => {
-                    if let Some(fault) = fault {
-                        return dav_fault_response(fault);
-                    }
                     // Fail-closed on destination inspection errors so MOVE/COPY cannot proceed blindly.
-                    return match err {
-                        FsError::Forbidden => {
-                            (StatusCode::FORBIDDEN, "Destination path is forbidden").into_response()
-                        }
-                        FsError::LoopDetected => (
-                            StatusCode::LOOP_DETECTED,
-                            "Shortcut loop detected while resolving Destination",
-                        )
-                            .into_response(),
-                        _ => (
-                            StatusCode::BAD_GATEWAY,
-                            "Failed to verify Destination against Feishu Drive",
-                        )
-                            .into_response(),
-                    };
+                    return dav_error_response(err, fault, "Destination");
                 }
             }
         }
@@ -462,6 +495,25 @@ async fn handle_dav(State(state): State<AppState>, req: Request) -> Response {
         }
     }
     resp
+}
+
+fn dav_error_response(err: FsError, fault: Option<DavHttpFault>, target: &str) -> Response {
+    if let Some(fault) = fault {
+        return dav_fault_response(fault);
+    }
+    match err {
+        FsError::Forbidden => (StatusCode::FORBIDDEN, format!("{target} is forbidden")).into_response(),
+        FsError::LoopDetected => (
+            StatusCode::LOOP_DETECTED,
+            format!("Shortcut loop detected while resolving {target}"),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to verify {target} against Feishu Drive"),
+        )
+            .into_response(),
+    }
 }
 
 fn dav_fault_response(fault: DavHttpFault) -> Response {
@@ -494,6 +546,13 @@ enum DestinationParseError {
     PrefixMismatch,
 }
 
+fn parse_request_dav_path(
+    uri: &axum::http::Uri,
+    prefix: &str,
+) -> Result<DavPath, DestinationParseError> {
+    normalize_dav_path(uri.path(), prefix)
+}
+
 fn parse_destination_dav_path(
     raw_dest: &str,
     prefix: &str,
@@ -501,21 +560,18 @@ fn parse_destination_dav_path(
     if raw_dest.starts_with("//") {
         return Err(DestinationParseError::Invalid);
     }
-    let raw_path = if raw_dest.starts_with('/') {
-        raw_dest.to_string()
-    } else {
-        let parsed = url::Url::parse(raw_dest).map_err(|_| DestinationParseError::Invalid)?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.fragment().is_some() {
-            return Err(DestinationParseError::Invalid);
-        }
-        let mut p = parsed.path().to_string();
-        if let Some(q) = parsed.query() {
-            p.push('?');
-            p.push_str(q);
-        }
-        p
-    };
-    let mut dav_path = DavPath::new(&raw_path).map_err(|_| DestinationParseError::Invalid)?;
+    if raw_dest.starts_with('/') {
+        return normalize_dav_path(raw_dest, prefix);
+    }
+    let parsed = url::Url::parse(raw_dest).map_err(|_| DestinationParseError::Invalid)?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.fragment().is_some() {
+        return Err(DestinationParseError::Invalid);
+    }
+    normalize_dav_path(parsed.path(), prefix)
+}
+
+fn normalize_dav_path(raw_path: &str, prefix: &str) -> Result<DavPath, DestinationParseError> {
+    let mut dav_path = DavPath::new(raw_path).map_err(|_| DestinationParseError::Invalid)?;
     if prefix != "/" {
         let full = dav_path.as_bytes();
         let pfx = prefix.as_bytes();

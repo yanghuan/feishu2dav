@@ -25,6 +25,10 @@ dav_prefix = "/dav"
 # Optional Feishu Drive folder token to mount as the WebDAV root (defaults to My Space root)
 # root_folder_token = "fldcnxxxxxxxxxxxxxxxx"
 
+# Optional additional Feishu Drive folder tokens to mount inside the WebDAV root (e.g. shared folders)
+# Accepts either a TOML array or a comma-separated string; folder names are fetched from Feishu
+# extra_folder_tokens = ["fldcnxxxxxxxxxxxxxxxx", "fldcnyyyyyyyyyyyyyyyy"]
+
 # Optional HTTP Basic Auth protecting the WebDAV endpoint
 # dav_username = "admin"
 # dav_password = "change-me"

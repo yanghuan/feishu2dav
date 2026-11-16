@@ -7,11 +7,13 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::DocMode;
-use crate::feishu::DriveFileItem;
+use crate::feishu::{DriveFileItem, FolderMeta};
+use crate::oauth::unix_now;
 
 const MAX_SIZE_CACHE_ENTRIES: usize = 10_000;
 const MAX_EXPORT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const EXPORT_CACHE_TTL: Duration = Duration::from_secs(120);
+const FOLDER_META_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
@@ -38,6 +40,8 @@ pub struct VirtualNode {
     pub entry_type: String,
     pub parent_token: String,
     pub kind: NodeKind,
+    /// True for externally configured root mount folders (`--extra-folder-tokens`)
+    pub is_mount: bool,
     pub created_time: Option<u64>,
     pub modified_time: Option<u64>,
     pub known_size: Option<u64>,
@@ -82,6 +86,12 @@ struct CachedDir {
     fetched_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct CachedFolderMeta {
+    meta: FolderMeta,
+    fetched_at: Instant,
+}
+
 #[derive(Debug)]
 struct CachedSize {
     size: u64,
@@ -111,11 +121,20 @@ pub struct VirtualZeroEntry {
     pub modified_time: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderMountStatus {
+    Mounted { name: String, token: String },
+    Failed { error: String },
+}
+
 pub struct DriveCache {
     epoch: Instant,
+    started_unix_secs: u64,
     dir_ttl: Duration,
     root_token: RwLock<Option<String>>,
     dirs: RwLock<HashMap<String, CachedDir>>,
+    folder_metas: RwLock<HashMap<String, CachedFolderMeta>>,
+    mount_statuses: RwLock<HashMap<String, FolderMountStatus>>,
     sizes: RwLock<HashMap<String, CachedSize>>,
     exports: RwLock<HashMap<ExportCacheKey, CachedExport>>,
     export_locks: Mutex<HashMap<ExportCacheKey, Arc<Mutex<()>>>>,
@@ -126,14 +145,21 @@ impl DriveCache {
     pub fn new(cache_ttl_secs: u64) -> Self {
         Self {
             epoch: Instant::now(),
+            started_unix_secs: unix_now(),
             dir_ttl: Duration::from_secs(cache_ttl_secs),
             root_token: RwLock::new(None),
             dirs: RwLock::new(HashMap::new()),
+            folder_metas: RwLock::new(HashMap::new()),
+            mount_statuses: RwLock::new(HashMap::new()),
             sizes: RwLock::new(HashMap::new()),
             exports: RwLock::new(HashMap::new()),
             export_locks: Mutex::new(HashMap::new()),
             virtual_zeros: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn started_unix_secs(&self) -> u64 {
+        self.started_unix_secs
     }
 
     fn now_millis(&self) -> u64 {
@@ -179,9 +205,52 @@ impl DriveCache {
         self.dirs.write().await.remove(folder_token);
     }
 
+    pub async fn get_folder_meta(&self, folder_token: &str) -> Option<FolderMeta> {
+        let ttl = self.dir_ttl.max(FOLDER_META_CACHE_TTL);
+        let guard = self.folder_metas.read().await;
+        let cached = guard.get(folder_token)?;
+        if cached.fetched_at.elapsed() <= ttl {
+            Some(cached.meta.clone())
+        } else {
+            None
+        }
+    }
+
+    pub async fn put_folder_meta(&self, folder_token: &str, meta: FolderMeta) {
+        self.folder_metas.write().await.insert(
+            folder_token.to_string(),
+            CachedFolderMeta {
+                meta,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
+    pub async fn set_mount_status(&self, folder_token: &str, status: FolderMountStatus) {
+        if self
+            .mount_statuses
+            .read()
+            .await
+            .get(folder_token)
+            .is_some_and(|existing| existing == &status)
+        {
+            return;
+        }
+        self.mount_statuses
+            .write()
+            .await
+            .insert(folder_token.to_string(), status);
+    }
+
+    pub async fn get_mount_status(&self, folder_token: &str) -> Option<FolderMountStatus> {
+        self.mount_statuses.read().await.get(folder_token).cloned()
+    }
+
     pub async fn clear_all(&self) {
         *self.root_token.write().await = None;
         self.dirs.write().await.clear();
+        self.folder_metas.write().await.clear();
+        self.mount_statuses.write().await.clear();
         self.sizes.write().await.clear();
         self.exports.write().await.clear();
         self.export_locks.lock().await.clear();
@@ -473,6 +542,7 @@ pub async fn build_virtual_nodes(
             entry_type: entry.item.file_type,
             parent_token: parent_token.to_string(),
             kind: entry.kind,
+            is_mount: false,
             created_time: entry.item.created_time,
             modified_time: entry.item.modified_time,
             known_size,
@@ -495,6 +565,7 @@ pub async fn build_virtual_nodes(
                 entry_type: "virtual_zero".to_string(),
                 parent_token: parent_token.to_string(),
                 kind: NodeKind::VirtualZeroFile,
+                is_mount: false,
                 created_time: Some(z.created_time),
                 modified_time: Some(z.modified_time),
                 known_size: Some(0),
@@ -505,7 +576,7 @@ pub async fn build_virtual_nodes(
     nodes
 }
 
-fn sanitize_segment(name: &str) -> String {
+pub(crate) fn sanitize_segment(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {
@@ -530,7 +601,7 @@ fn ensure_extension(name: &str, ext: &str) -> String {
     }
 }
 
-fn dedup_name(base: &str, token: &str, used: &mut HashSet<String>) -> String {
+pub(crate) fn dedup_name(base: &str, token: &str, used: &mut HashSet<String>) -> String {
     if used.insert(base.to_string()) {
         return base.to_string();
     }

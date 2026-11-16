@@ -590,6 +590,7 @@ mod tests {
             scopes: "drive:drive offline_access".to_string(),
             dav_prefix: "/dav".to_string(),
             root_folder_token: None,
+            extra_folder_tokens: Vec::new(),
             dav_username: None,
             dav_password: None,
             cache_ttl_secs: 30,

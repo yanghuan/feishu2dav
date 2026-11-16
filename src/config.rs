@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{AppError, AppResult};
 
@@ -79,6 +80,17 @@ pub struct Cli {
     #[arg(long, env = "FEISHU2DAV_ROOT_FOLDER_TOKEN", global = true)]
     pub root_folder_token: Option<String>,
 
+    /// Optional additional Feishu Drive folder tokens to mount under the WebDAV root
+    /// (supports comma-separated values or repeated flags)
+    #[arg(
+        long,
+        alias = "mount-folder-tokens",
+        env = "FEISHU2DAV_EXTRA_FOLDER_TOKENS",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub extra_folder_tokens: Option<Vec<String>>,
+
     /// Optional WebDAV HTTP Basic Auth username
     #[arg(long, env = "FEISHU2DAV_USERNAME", global = true)]
     pub dav_username: Option<String>,
@@ -146,6 +158,8 @@ struct FileConfig {
     scopes: Option<String>,
     dav_prefix: Option<String>,
     root_folder_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_vec")]
+    extra_folder_tokens: Option<Vec<String>>,
     dav_username: Option<String>,
     dav_password: Option<String>,
     cache_ttl_secs: Option<u64>,
@@ -169,6 +183,7 @@ pub struct Config {
     pub scopes: String,
     pub dav_prefix: String,
     pub root_folder_token: Option<String>,
+    pub extra_folder_tokens: Vec<String>,
     pub dav_username: Option<String>,
     pub dav_password: Option<String>,
     pub cache_ttl_secs: u64,
@@ -290,6 +305,11 @@ impl Config {
                 .clone()
                 .or(file_cfg.root_folder_token),
         )?;
+        let extra_folder_tokens = normalize_folder_tokens(
+            cli.extra_folder_tokens
+                .clone()
+                .or(file_cfg.extra_folder_tokens),
+        )?;
 
         let dav_username = cli.dav_username.clone().or(file_cfg.dav_username);
         let dav_password = cli.dav_password.clone().or(file_cfg.dav_password);
@@ -332,6 +352,7 @@ impl Config {
             scopes,
             dav_prefix,
             root_folder_token,
+            extra_folder_tokens,
             dav_username,
             dav_password,
             cache_ttl_secs,
@@ -427,10 +448,7 @@ pub fn normalize_prefix(raw: &str) -> String {
     }
 }
 
-fn normalize_folder_token(raw: Option<String>) -> AppResult<Option<String>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
+fn validate_folder_token(field_name: &str, raw: &str) -> AppResult<Option<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -441,10 +459,51 @@ fn normalize_folder_token(raw: Option<String>) -> AppResult<Option<String>> {
         || trimmed.chars().any(char::is_whitespace)
     {
         return Err(AppError::Config(format!(
-            "invalid root_folder_token '{trimmed}': pass the bare Feishu folder token (e.g. 'fldcn...'), not a full URL or path"
+            "invalid {field_name} '{trimmed}': pass the bare Feishu folder token (e.g. 'fldcn...'), not a full URL or path"
         )));
     }
     Ok(Some(trimmed.to_string()))
+}
+
+fn normalize_folder_token(raw: Option<String>) -> AppResult<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    validate_folder_token("root_folder_token", &raw)
+}
+
+fn normalize_folder_tokens(raw: Option<Vec<String>>) -> AppResult<Vec<String>> {
+    let Some(items) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if let Some(tok) = validate_folder_token("extra_folder_tokens", &item)?
+            && seen.insert(tok.clone())
+        {
+            out.push(tok);
+        }
+    }
+    Ok(out)
+}
+
+fn deserialize_opt_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Str(String),
+        Vec(Vec<String>),
+    }
+
+    let opt = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(opt.map(|val| match val {
+        StringOrVec::Str(s) => s.split(',').map(str::to_string).collect(),
+        StringOrVec::Vec(v) => v,
+    }))
 }
 
 #[cfg(test)]
@@ -587,5 +646,99 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::load_from_cli(&cli_url).is_err());
+    }
+
+    #[test]
+    fn extra_folder_tokens_supports_multiple_comma_alias_toml_and_rejects_urls() {
+        let cli_multi = Cli::try_parse_from([
+            "feishu2dav",
+            "--app-id",
+            "cli_x",
+            "--app-secret",
+            "sec_x",
+            "--extra-folder-tokens",
+            " fld_a , , fld_b ",
+            "--extra-folder-tokens",
+            "fld_a,fld_c",
+        ])
+        .unwrap();
+        let cfg = Config::load_from_cli(&cli_multi).unwrap();
+        assert_eq!(cfg.extra_folder_tokens, vec!["fld_a", "fld_b", "fld_c"]);
+
+        let cli_alias = Cli::try_parse_from([
+            "feishu2dav",
+            "--app-id",
+            "cli_x",
+            "--app-secret",
+            "sec_x",
+            "--mount-folder-tokens",
+            "fld_x,fld_y",
+        ])
+        .unwrap();
+        let cfg_alias = Config::load_from_cli(&cli_alias).unwrap();
+        assert_eq!(cfg_alias.extra_folder_tokens, vec!["fld_x", "fld_y"]);
+
+        let cli_url = Cli::try_parse_from([
+            "feishu2dav",
+            "--app-id",
+            "cli_x",
+            "--app-secret",
+            "sec_x",
+            "--extra-folder-tokens",
+            "https://my.feishu.cn/drive/folder/fld_a",
+        ])
+        .unwrap();
+        assert!(Config::load_from_cli(&cli_url).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("cfg.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+app_id = "cli_x"
+app_secret = "sec_x"
+extra_folder_tokens = ["fld_1", "fld_2", "fld_1"]
+"#,
+        )
+        .unwrap();
+        let cli_toml = Cli::try_parse_from([
+            "feishu2dav",
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg_toml = Config::load_from_cli(&cli_toml).unwrap();
+        assert_eq!(cfg_toml.extra_folder_tokens, vec!["fld_1", "fld_2"]);
+
+        // Passing empty CLI value overrides TOML cleanly to empty list
+        let cli_clear = Cli::try_parse_from([
+            "feishu2dav",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--extra-folder-tokens",
+            "",
+        ])
+        .unwrap();
+        let cfg_clear = Config::load_from_cli(&cli_clear).unwrap();
+        assert!(cfg_clear.extra_folder_tokens.is_empty());
+
+        // String form in TOML also works
+        std::fs::write(
+            &cfg_path,
+            r#"
+app_id = "cli_x"
+app_secret = "sec_x"
+extra_folder_tokens = "fld_s1, fld_s2"
+"#,
+        )
+        .unwrap();
+        let cli_str_toml = Cli::try_parse_from([
+            "feishu2dav",
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg_str_toml = Config::load_from_cli(&cli_str_toml).unwrap();
+        assert_eq!(cfg_str_toml.extra_folder_tokens, vec!["fld_s1", "fld_s2"]);
     }
 }

@@ -85,6 +85,12 @@ async fn run_serve(
     if let Some(ref root_folder_token) = config.root_folder_token {
         info!(root_folder_token, "Mounting configured Feishu folder as WebDAV root");
     }
+    if !config.extra_folder_tokens.is_empty() {
+        info!(
+            extra_folder_tokens = ?config.extra_folder_tokens,
+            "Mounting additional Feishu folders under WebDAV root"
+        );
+    }
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
@@ -184,6 +190,32 @@ async fn run_status(
             }
             Err(err) => {
                 println!("Drive root check failed: {err}");
+            }
+        }
+    }
+    for (idx, extra_tok) in config.extra_folder_tokens.iter().enumerate() {
+        match state.client.get_folder_meta(extra_tok).await {
+            Ok(meta) => match state.client.list_files(&meta.token).await {
+                Ok(items) => {
+                    println!(
+                        "Extra mount [{}]:    {} ({}) -> ok ({} item(s))",
+                        idx + 1,
+                        meta.name,
+                        meta.token,
+                        items.len()
+                    );
+                }
+                Err(err) => {
+                    println!(
+                        "Extra mount [{}]:    {} ({}) -> list failed: {err}",
+                        idx + 1,
+                        meta.name,
+                        meta.token
+                    );
+                }
+            },
+            Err(err) => {
+                println!("Extra mount [{}]:    {extra_tok} -> failed: {err}", idx + 1);
             }
         }
     }

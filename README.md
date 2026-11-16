@@ -75,6 +75,7 @@ cargo run -- serve
 | `--token-file` / `FEISHU2DAV_TOKEN_FILE` | `feishu2dav-tokens.json` | OAuth 令牌持久化路径 |
 | `--dav-prefix` / `FEISHU2DAV_PREFIX` | `/dav` | WebDAV 挂载前缀（支持 `/dav` 或 `/`） |
 | `--root-folder-token` / `FEISHU2DAV_ROOT_FOLDER_TOKEN` | 无 | 指定要挂载为 WebDAV 根目录的飞书文件夹 token（默认挂载「我的空间」根目录） |
+| `--extra-folder-tokens`（兼容别名 `--mount-folder-tokens`） / `FEISHU2DAV_EXTRA_FOLDER_TOKENS` | 无 | 在默认根目录（或 `--root-folder-token`）下额外挂载的飞书文件夹 token 列表，支持逗号分隔或重复传参（自动从飞书获取文件夹名并按 300s TTL 缓存；无权/失效 token 会记录告警并跳过，面板状态随访问最多 300s 刷新，实时诊断请运行 `feishu2dav status`；挂载点本身禁止 `DELETE`/`MOVE`/`COPY`，内部文件/子目录可正常读写；传入空值 `""` 可清空配置文件中的同名列表） |
 | `--dav-username` / `FEISHU2DAV_USERNAME` | 无 | 可选 WebDAV Basic Auth 用户名 |
 | `--dav-password` / `FEISHU2DAV_PASSWORD` | 无 | 可选 WebDAV Basic Auth 密码 |
 | `--doc-mode` / `FEISHU2DAV_DOC_MODE` | `export` | 云文档模式：`export` / `url` / `files_only`（兼容 `files-only`） |
@@ -120,7 +121,7 @@ docker run -d \
   ghcr.io/yanghuan/feishu2dav:latest
 ```
 
-> 容器内默认监听 `0.0.0.0:4918`，OAuth 回调默认指向 `http://127.0.0.1:4918/oauth/callback`，令牌持久化在 `/data/feishu2dav-tokens.json`。如需挂载共享文件夹作为根目录，可追加 `-e FEISHU2DAV_ROOT_FOLDER_TOKEN="fldcnxxxxxxxxxxxxxxxx"`；局域网/公网部署请按实际访问域名设置 `-e FEISHU_REDIRECT_URI="https://your-domain/oauth/callback"`。
+> 容器内默认监听 `0.0.0.0:4918`，OAuth 回调默认指向 `http://127.0.0.1:4918/oauth/callback`，令牌持久化在 `/data/feishu2dav-tokens.json`。如需挂载共享文件夹作为根目录，可追加 `-e FEISHU2DAV_ROOT_FOLDER_TOKEN="fldcnxxxxxxxxxxxxxxxx"`；如需在保留默认「我的空间」根目录的同时把一个或多个共享文件夹额外挂载到根目录下，可追加 `-e FEISHU2DAV_EXTRA_FOLDER_TOKENS="fldcnxxxxxxxxxxxxxxxx,fldcnyyyyyyyyyyyyyyyy"`；局域网/公网部署请按实际访问域名设置 `-e FEISHU_REDIRECT_URI="https://your-domain/oauth/callback"`。
 
 ## 运行测试
 

@@ -176,6 +176,31 @@ pub struct RootFolderMeta {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FolderMeta {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(
+        default,
+        alias = "createTime",
+        alias = "create_time",
+        deserialize_with = "deserialize_opt_u64_lenient"
+    )]
+    pub created_time: Option<u64>,
+    #[serde(
+        default,
+        alias = "modifiedTime",
+        alias = "editTime",
+        alias = "latest_modify_time",
+        deserialize_with = "deserialize_opt_u64_lenient"
+    )]
+    pub modified_time: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShortcutInfo {
     pub target_type: String,
     pub target_token: String,
@@ -425,6 +450,33 @@ impl FeishuClient {
         let url = self.api_url("/open-apis/drive/explorer/v2/root_folder/meta");
         self.call_json(|client, token| client.get(&url).bearer_auth(token))
             .await
+    }
+
+    pub async fn get_folder_meta(&self, folder_token: &str) -> AppResult<FolderMeta> {
+        let trimmed = folder_token.trim();
+        if trimmed.is_empty()
+            || trimmed.contains('/')
+            || trimmed.contains('?')
+            || trimmed.contains('#')
+            || trimmed.chars().any(char::is_whitespace)
+        {
+            return Err(AppError::InvalidInput(format!(
+                "invalid folder_token '{folder_token}'"
+            )));
+        }
+        let url = self.api_url(&format!(
+            "/open-apis/drive/explorer/v2/folder/{trimmed}/meta"
+        ));
+        let mut meta: FolderMeta = self
+            .call_json(|client, token| client.get(&url).bearer_auth(token))
+            .await?;
+        if meta.token.trim().is_empty() {
+            meta.token = trimmed.to_string();
+        }
+        if meta.name.trim().is_empty() {
+            meta.name = meta.token.clone();
+        }
+        Ok(meta)
     }
 
     pub async fn list_files(&self, folder_token: &str) -> AppResult<Vec<DriveFileItem>> {
